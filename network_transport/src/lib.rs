@@ -17,52 +17,69 @@ pub const NODE_CONC:      u8 = 0;
 pub const NODE_RESOLVE:   u8 = 62;  // conc resolves well-known service, patches to real node
 pub const NODE_BROADCAST: u8 = 63;
 
-// ── Service IDs (10 bits, u16 numeric index) ─────────────────────────
+// ── Service IDs (6 bits, 0-63, used as id within TYPE_SERVICE) ────────
 
-pub const SVC_NODE:              u16 = 0;
-pub const SVC_FAST_THINKER:      u16 = 1;
-pub const SVC_DEEP_THINKER:      u16 = 2;
-pub const SVC_PROCESS_ENGINE:    u16 = 3;
-pub const SVC_REPO_HOST:         u16 = 4;
-pub const SVC_CODER_HOST:        u16 = 5;
-pub const SVC_VOICE_PROCESSOR:   u16 = 6;
-pub const SVC_PROMPT_PROCESSOR:  u16 = 7;
-pub const SVC_HEURISTIC_ROUTER:  u16 = 8;
-pub const SVC_TERMINAL:          u16 = 9;
-pub const SVC_ASR:               u16 = 10;
-pub const SVC_DISPLAY:           u16 = 11;
-// 12-63: reserved well-known
-pub const SVC_DYNAMIC:           u16 = 65;
-// 65-1023: dynamic
+pub const SVC_NODE:              u8 = 0;
+pub const SVC_FAST_THINKER:      u8 = 1;
+pub const SVC_DEEP_THINKER:      u8 = 2;
+pub const SVC_PROCESS_ENGINE:    u8 = 3;
+pub const SVC_REPO_HOST:         u8 = 4;
+pub const SVC_CODER_HOST:        u8 = 5;
+pub const SVC_VOICE_PROCESSOR:   u8 = 6;
+pub const SVC_PROMPT_PROCESSOR:  u8 = 7;
+pub const SVC_HEURISTIC_ROUTER:  u8 = 8;
+pub const SVC_TERMINAL:          u8 = 9;
+pub const SVC_ASR:               u8 = 10;
+pub const SVC_DISPLAY:           u8 = 11;
+// 12-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
 
-pub const ROLE_NODE:              u64 = 1 << SVC_NODE;              // 1
-pub const ROLE_FAST_THINKER:      u64 = 1 << SVC_FAST_THINKER;      // 2
-pub const ROLE_DEEP_THINKER:      u64 = 1 << SVC_DEEP_THINKER;      // 4
-pub const ROLE_PROCESS_ENGINE:    u64 = 1 << SVC_PROCESS_ENGINE;    // 8
-pub const ROLE_REPO_HOST:         u64 = 1 << SVC_REPO_HOST;         // 16
-pub const ROLE_CODER_HOST:        u64 = 1 << SVC_CODER_HOST;        // 32
-pub const ROLE_VOICE_PROCESSOR:   u64 = 1 << SVC_VOICE_PROCESSOR;   // 64
-pub const ROLE_PROMPT_PROCESSOR:  u64 = 1 << SVC_PROMPT_PROCESSOR;  // 128
-pub const ROLE_HEURISTIC_ROUTER:  u64 = 1 << SVC_HEURISTIC_ROUTER;  // 256
-pub const ROLE_TERMINAL:          u64 = 1 << SVC_TERMINAL;          // 512
-pub const ROLE_ASR:               u64 = 1 << SVC_ASR;               // 1024
-pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;           // 2048
+pub const ROLE_NODE:              u64 = 1 << SVC_NODE;
+pub const ROLE_FAST_THINKER:      u64 = 1 << SVC_FAST_THINKER;
+pub const ROLE_DEEP_THINKER:      u64 = 1 << SVC_DEEP_THINKER;
+pub const ROLE_PROCESS_ENGINE:    u64 = 1 << SVC_PROCESS_ENGINE;
+pub const ROLE_REPO_HOST:         u64 = 1 << SVC_REPO_HOST;
+pub const ROLE_CODER_HOST:        u64 = 1 << SVC_CODER_HOST;
+pub const ROLE_VOICE_PROCESSOR:   u64 = 1 << SVC_VOICE_PROCESSOR;
+pub const ROLE_PROMPT_PROCESSOR:  u64 = 1 << SVC_PROMPT_PROCESSOR;
+pub const ROLE_HEURISTIC_ROUTER:  u64 = 1 << SVC_HEURISTIC_ROUTER;
+pub const ROLE_TERMINAL:          u64 = 1 << SVC_TERMINAL;
+pub const ROLE_ASR:               u64 = 1 << SVC_ASR;
+pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;
 
-pub const fn svc_to_role(svc: u16) -> u64 { 1u64 << svc }
-pub const fn role_to_svc(role: u64) -> u16 { role.trailing_zeros() as u16 }
+pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
+pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
 
-// ── Endpoint: node(6) + service(10) packed as u16 ────────────────────
+// ── Address: node(6) + type(4) + id(6) packed as u16 ─────────────────
 
-pub const fn endpoint(node_id: u8, service_id: u16) -> u16 {
-    ((node_id as u16) << 10) | (service_id & 0x3FF)
+pub const fn addr(node_id: u8, res_type: u8, id: u8) -> u16 {
+    ((node_id as u16 & 0x3F) << 10) | ((res_type as u16 & 0xF) << 6) | (id as u16 & 0x3F)
 }
-pub const fn ep_node(ep: u16) -> u8 { (ep >> 10) as u8 }
-pub const fn ep_service(ep: u16) -> u16 { ep & 0x3FF }
+pub const fn addr_node(a: u16) -> u8 { (a >> 10) as u8 & 0x3F }
+pub const fn addr_type(a: u16) -> u8 { (a >> 6) as u8 & 0xF }
+pub const fn addr_id(a: u16) -> u8 { a as u8 & 0x3F }
+
+/// Shorthand: service endpoint = addr(node, TYPE_SERVICE, svc_id)
+pub const fn endpoint(node_id: u8, svc_id: u8) -> u16 {
+    addr(node_id, TYPE_SERVICE, svc_id)
+}
+pub const fn ep_node(ep: u16) -> u8 { addr_node(ep) }
+pub const fn ep_service(ep: u16) -> u8 { addr_id(ep) }
+
 pub const fn mesh_key(src: u16, dst: u16) -> u32 { ((src as u32) << 16) | (dst as u32) }
 pub const fn mesh_src(key: u32) -> u16 { (key >> 16) as u16 }
 pub const fn mesh_dst(key: u32) -> u16 { key as u16 }
+
+// ── Resource types (4 bits) ──────────────────────────────────────────
+
+pub const TYPE_SERVICE:  u8 = 0;
+pub const TYPE_PROJECT:  u8 = 1;
+pub const TYPE_TASK:     u8 = 2;
+pub const TYPE_PROCESS:  u8 = 3;
+pub const TYPE_NOTE:     u8 = 4;
+pub const TYPE_TERMINAL: u8 = 5;
+// 6-15: reserved
 
 // ── Endpoint display/parse (universal alias) ─────────────────────────
 
@@ -96,29 +113,46 @@ pub fn ep_parse(s: &str) -> Option<u16> {
     Some(result)
 }
 
-/// Format an endpoint for human display: "node/svc" or well-known name.
-pub fn ep_label(ep: u16) -> String {
-    let node = ep_node(ep);
-    let svc = ep_service(ep);
-    let svc_name = match svc {
-        SVC_NODE => "node",
-        SVC_FAST_THINKER => "fast_thinker",
-        SVC_DEEP_THINKER => "deep_thinker",
-        SVC_PROCESS_ENGINE => "process_engine",
-        SVC_REPO_HOST => "repo_host",
-        SVC_CODER_HOST => "coder_host",
-        SVC_VOICE_PROCESSOR => "voice_processor",
-        SVC_PROMPT_PROCESSOR => "prompt_processor",
-        SVC_HEURISTIC_ROUTER => "heuristic_router",
-        SVC_TERMINAL => "terminal",
-        SVC_ASR => "asr",
-        SVC_DISPLAY => "display",
-        _ => return format!("{}/{}", node, svc),
+/// Format an address for human display.
+pub fn addr_label(a: u16) -> String {
+    let node = addr_node(a);
+    let typ = addr_type(a);
+    let id = addr_id(a);
+
+    let node_str = match node {
+        NODE_CONC => "conc".into(),
+        NODE_RESOLVE => "?".into(),
+        NODE_BROADCAST => "*".into(),
+        n => format!("{}", n),
     };
-    if node == NODE_CONC { return format!("conc/{}", svc_name); }
-    if node == NODE_RESOLVE { return format!("?/{}", svc_name); }
-    if node == NODE_BROADCAST { return format!("*/{}", svc_name); }
-    format!("{}/{}", node, svc_name)
+
+    let type_str = match typ {
+        TYPE_SERVICE => {
+            let svc_name = match id {
+                SVC_NODE => "node",
+                SVC_FAST_THINKER => "fast_thinker",
+                SVC_DEEP_THINKER => "deep_thinker",
+                SVC_PROCESS_ENGINE => "process_engine",
+                SVC_REPO_HOST => "repo_host",
+                SVC_CODER_HOST => "coder_host",
+                SVC_VOICE_PROCESSOR => "voice_processor",
+                SVC_PROMPT_PROCESSOR => "prompt_processor",
+                SVC_HEURISTIC_ROUTER => "heuristic_router",
+                SVC_TERMINAL => "terminal",
+                SVC_ASR => "asr",
+                SVC_DISPLAY => "display",
+                _ => return format!("{}/svc:{}", node_str, id),
+            };
+            return format!("{}/{}", node_str, svc_name);
+        }
+        TYPE_PROJECT => "proj",
+        TYPE_TASK => "task",
+        TYPE_PROCESS => "proc",
+        TYPE_NOTE => "note",
+        TYPE_TERMINAL => "term",
+        _ => return format!("{}/t{}:{}", node_str, typ, id),
+    };
+    format!("{}/{}:{}", node_str, type_str, id)
 }
 
 // ── Flags (u16) ──────────────────────────────────────────────────────
@@ -258,8 +292,10 @@ impl Frame {
     pub fn to_ep(&self) -> u16 { mesh_dst(self.mesh_key) }
     pub fn from_node(&self) -> u8 { ep_node(self.from_ep()) }
     pub fn to_node(&self) -> u8 { ep_node(self.to_ep()) }
-    pub fn from_service(&self) -> u16 { ep_service(self.from_ep()) }
-    pub fn to_service(&self) -> u16 { ep_service(self.to_ep()) }
+    pub fn from_service(&self) -> u8 { ep_service(self.from_ep()) }
+    pub fn to_service(&self) -> u8 { ep_service(self.to_ep()) }
+    pub fn from_type(&self) -> u8 { addr_type(self.from_ep()) }
+    pub fn to_type(&self) -> u8 { addr_type(self.to_ep()) }
     pub fn format(&self) -> u16 { flags_format(self.flags) }
     pub fn is_fin(&self) -> bool { flags_is_fin(self.flags) }
     pub fn is_rst(&self) -> bool { flags_is_rst(self.flags) }
@@ -386,9 +422,9 @@ mod tests {
         assert_eq!(ep_node(ep), 5);
         assert_eq!(ep_service(ep), SVC_FAST_THINKER);
 
-        let ep2 = endpoint(NODE_BROADCAST, 1023);
+        let ep2 = endpoint(NODE_BROADCAST, 63);
         assert_eq!(ep_node(ep2), NODE_BROADCAST);
-        assert_eq!(ep_service(ep2), 1023);
+        assert_eq!(ep_service(ep2), 63);
     }
 
     #[test]
@@ -402,7 +438,7 @@ mod tests {
 
     #[test]
     fn ep_display_parse_roundtrip() {
-        for ep in [0u16, 1, 42, 1023, endpoint(5, SVC_FAST_THINKER), endpoint(NODE_BROADCAST, 1023)] {
+        for ep in [0u16, 1, 42, 63, endpoint(5, SVC_FAST_THINKER), endpoint(NODE_BROADCAST, 63)] {
             let s = ep_display(ep);
             let parsed = ep_parse(&s).unwrap();
             assert_eq!(parsed, ep, "roundtrip failed for ep={}: display='{}' parsed={}", ep, s, parsed);
@@ -418,10 +454,10 @@ mod tests {
 
     #[test]
     fn ep_label_well_known() {
-        assert_eq!(ep_label(endpoint(3, SVC_FAST_THINKER)), "3/fast_thinker");
-        assert_eq!(ep_label(endpoint(NODE_CONC, SVC_NODE)), "conc/node");
-        assert_eq!(ep_label(endpoint(NODE_RESOLVE, SVC_TERMINAL)), "?/terminal");
-        assert_eq!(ep_label(endpoint(5, 100)), "5/100"); // dynamic
+        assert_eq!(addr_label(endpoint(3, SVC_FAST_THINKER)), "3/fast_thinker");
+        assert_eq!(addr_label(endpoint(NODE_CONC, SVC_NODE)), "conc/node");
+        assert_eq!(addr_label(endpoint(NODE_RESOLVE, SVC_TERMINAL)), "?/terminal");
+        assert_eq!(addr_label(endpoint(5, 20)), "5/svc:20"); // dynamic service
     }
 
     #[test]
