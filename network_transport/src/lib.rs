@@ -51,6 +51,48 @@ pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;
 pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
 pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
 
+/// Convert a services bitmap to a human-readable string.
+pub fn services_to_str(services: u64) -> String {
+    const NAMES: &[(u8, &str)] = &[
+        (SVC_NODE, "node"), (SVC_FAST_THINKER, "fast_thinker"),
+        (SVC_DEEP_THINKER, "deep_thinker"), (SVC_PROCESS_ENGINE, "process_engine"),
+        (SVC_REPO_HOST, "repo_host"), (SVC_CODER_HOST, "coder_host"),
+        (SVC_VOICE_PROCESSOR, "voice_processor"), (SVC_PROMPT_PROCESSOR, "prompt_processor"),
+        (SVC_HEURISTIC_ROUTER, "heuristic_router"), (SVC_TERMINAL, "terminal"),
+        (SVC_ASR, "asr"), (SVC_DISPLAY, "display"),
+    ];
+    let mut parts = Vec::new();
+    for &(svc, name) in NAMES {
+        if services & (1u64 << svc) != 0 {
+            parts.push(name);
+        }
+    }
+    if parts.is_empty() { "none".into() } else { parts.join(", ") }
+}
+
+/// Convert a list of service name strings to a services bitmap.
+pub fn services_from_strs(names: &[String]) -> u64 {
+    let mut services: u64 = ROLE_NODE;
+    for name in names {
+        match name.as_str() {
+            "node" => services |= ROLE_NODE,
+            "fast_thinker" | "thinker" => services |= ROLE_FAST_THINKER,
+            "deep_thinker" => services |= ROLE_DEEP_THINKER,
+            "process_engine" | "process_host" => services |= ROLE_PROCESS_ENGINE,
+            "repo_host" | "repo" => services |= ROLE_REPO_HOST,
+            "coder_host" | "coder" => services |= ROLE_CODER_HOST,
+            "voice_processor" => services |= ROLE_VOICE_PROCESSOR,
+            "prompt_processor" => services |= ROLE_PROMPT_PROCESSOR,
+            "heuristic_router" => services |= ROLE_HEURISTIC_ROUTER,
+            "terminal" => services |= ROLE_TERMINAL,
+            "asr" => services |= ROLE_ASR,
+            "display" => services |= ROLE_DISPLAY,
+            _ => {}
+        }
+    }
+    services
+}
+
 // ── Address: node(6) + type(4) + id(6) packed as u16 ─────────────────
 
 pub const fn addr(node_id: u8, res_type: u8, id: u8) -> u16 {
