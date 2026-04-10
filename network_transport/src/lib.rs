@@ -1,454 +1,320 @@
-//! Network transport wire format — Message types and binary codec.
+//! Network transport wire format.
 //!
-//! No IO, no async. Pure data types + serialization.
+//! Unified 16-byte frame header for all traffic (stream 0 control + data streams):
 //!
-//! Wire frame:
-//!   [version: u32 LE][checksum: u32 LE][len: u32 LE][bincode Message]
+//!   [version: u16 LE][checksum: u16 LE][mesh_key: u32 LE][ext: u32 LE][flags: u16 LE][len: u16 LE][payload]
 //!
-//! Checksum: internet checksum (RFC 1071) over the full frame with
-//! version, checksum, and len fields zeroed during computation.
+//! No IO, no async. Pure types + codec.
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const FRAME_HEADER_SIZE: usize = 16;
 
-/// Frame header size: version(4) + checksum(4) + len(4) = 12 bytes.
-pub const FRAME_HEADER_SIZE: usize = 12;
+// ── Node IDs (6 bits) ────────────────────────────────────────────────
 
-// ── Message ──────────────────────────────────────────────────────────
+pub const NODE_CONC:      u8 = 0;
+pub const NODE_RESOLVE:   u8 = 62;  // conc resolves well-known service, patches to real node
+pub const NODE_BROADCAST: u8 = 63;
 
-/// Top-level message envelope. Routed by `from`/`to` fields.
-/// Addresses use `service@node-id` format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Message {
-    /// Windowed message ID (monotonic u32, wraps).
-    pub id: u32,
-    /// Sender address: `service@node-id` or `@node-id`.
-    pub from: String,
-    /// Destination: `service@node-id`, well-known service, `@*`, `@conc`.
-    pub to: String,
-    /// On-behalf-of: responses go here instead of `from`.
-    pub obo: Option<String>,
-    /// Message body.
-    pub body: Body,
+// ── Service IDs (10 bits, u16 numeric index) ─────────────────────────
+
+pub const SVC_NODE:              u16 = 0;
+pub const SVC_FAST_THINKER:      u16 = 1;
+pub const SVC_DEEP_THINKER:      u16 = 2;
+pub const SVC_PROCESS_ENGINE:    u16 = 3;
+pub const SVC_REPO_HOST:         u16 = 4;
+pub const SVC_CODER_HOST:        u16 = 5;
+pub const SVC_VOICE_PROCESSOR:   u16 = 6;
+pub const SVC_PROMPT_PROCESSOR:  u16 = 7;
+pub const SVC_HEURISTIC_ROUTER:  u16 = 8;
+pub const SVC_TERMINAL:          u16 = 9;
+pub const SVC_ASR:               u16 = 10;
+pub const SVC_DISPLAY:           u16 = 11;
+// 12-63: reserved well-known
+pub const SVC_DYNAMIC:           u16 = 65;
+// 65-1023: dynamic
+
+// ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
+
+pub const ROLE_NODE:              u64 = 1 << SVC_NODE;              // 1
+pub const ROLE_FAST_THINKER:      u64 = 1 << SVC_FAST_THINKER;      // 2
+pub const ROLE_DEEP_THINKER:      u64 = 1 << SVC_DEEP_THINKER;      // 4
+pub const ROLE_PROCESS_ENGINE:    u64 = 1 << SVC_PROCESS_ENGINE;    // 8
+pub const ROLE_REPO_HOST:         u64 = 1 << SVC_REPO_HOST;         // 16
+pub const ROLE_CODER_HOST:        u64 = 1 << SVC_CODER_HOST;        // 32
+pub const ROLE_VOICE_PROCESSOR:   u64 = 1 << SVC_VOICE_PROCESSOR;   // 64
+pub const ROLE_PROMPT_PROCESSOR:  u64 = 1 << SVC_PROMPT_PROCESSOR;  // 128
+pub const ROLE_HEURISTIC_ROUTER:  u64 = 1 << SVC_HEURISTIC_ROUTER;  // 256
+pub const ROLE_TERMINAL:          u64 = 1 << SVC_TERMINAL;          // 512
+pub const ROLE_ASR:               u64 = 1 << SVC_ASR;               // 1024
+pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;           // 2048
+
+pub const fn svc_to_role(svc: u16) -> u64 { 1u64 << svc }
+pub const fn role_to_svc(role: u64) -> u16 { role.trailing_zeros() as u16 }
+
+// ── Endpoint: node(6) + service(10) packed as u16 ────────────────────
+
+pub const fn endpoint(node_id: u8, service_id: u16) -> u16 {
+    ((node_id as u16) << 10) | (service_id & 0x3FF)
+}
+pub const fn ep_node(ep: u16) -> u8 { (ep >> 10) as u8 }
+pub const fn ep_service(ep: u16) -> u16 { ep & 0x3FF }
+pub const fn mesh_key(src: u16, dst: u16) -> u32 { ((src as u32) << 16) | (dst as u32) }
+pub const fn mesh_src(key: u32) -> u16 { (key >> 16) as u16 }
+pub const fn mesh_dst(key: u32) -> u16 { key as u16 }
+
+// ── Flags (u16) ──────────────────────────────────────────────────────
+
+// Format (bits 15-13)
+pub const FMT_JSONL:   u16 = 0 << 13;
+pub const FMT_BINCODE: u16 = 1 << 13;
+pub const FMT_RAW:     u16 = 2 << 13;
+pub const FMT_MASK:    u16 = 0x7 << 13;
+
+// TCP-like flags
+pub const FLAG_FIN: u16 = 1 << 12;
+pub const FLAG_RST: u16 = 1 << 11;
+pub const FLAG_ACK: u16 = 1 << 10;
+pub const FLAG_SYN: u16 = 1 << 9;
+
+// TTL (bits 8-5, log-scaled, only meaningful with SYN)
+pub const TTL_SHIFT: u16 = 5;
+pub const TTL_MASK:  u16 = 0xF << 5;
+
+pub const fn flags_format(flags: u16) -> u16 { (flags & FMT_MASK) >> 13 }
+pub const fn flags_ttl(flags: u16) -> u8 { ((flags & TTL_MASK) >> TTL_SHIFT) as u8 }
+pub const fn flags_is_fin(flags: u16) -> bool { flags & FLAG_FIN != 0 }
+pub const fn flags_is_rst(flags: u16) -> bool { flags & FLAG_RST != 0 }
+pub const fn flags_is_ack(flags: u16) -> bool { flags & FLAG_ACK != 0 }
+pub const fn flags_is_syn(flags: u16) -> bool { flags & FLAG_SYN != 0 }
+
+/// TTL lookup table: index → seconds. 0 = infinite.
+pub const TTL_LUT: [u32; 16] = [
+    0, 1, 5, 10, 30, 60, 300, 1800,
+    3600, 14400, 86400, 604800, 31536000,
+    0, 0, 0,
+];
+
+pub const fn ttl_seconds(ttl_bits: u8) -> u32 { TTL_LUT[ttl_bits as usize & 0xF] }
+
+// ── Ext field: obo(u16) + in_reply_to(u16) ──────────────────────────
+
+pub const fn ext_pack(obo: u16, in_reply_to: u16) -> u32 {
+    ((obo as u32) << 16) | (in_reply_to as u32)
+}
+pub const fn ext_obo(ext: u32) -> u16 { (ext >> 16) as u16 }
+pub const fn ext_irt(ext: u32) -> u16 { ext as u16 }
+
+// ── Frame ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frame {
+    pub mesh_key: u32,
+    pub ext: u32,
+    pub flags: u16,
+    pub payload: Vec<u8>,
 }
 
-/// Message body variants.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum Body {
-    // ── Connection lifecycle ──
-    /// First message on a new connection. Required before any other message.
-    Ident {
-        node_id: String,
-        label: String,
-        roles: u64,
-        objects: Vec<NodeObject>,
-    },
-    /// Peer list from concentrator.
-    NodeList { nodes: Vec<NodeEntry> },
+impl Frame {
+    /// Encode to wire bytes: [version:u16][checksum:u16][mesh_key:u32][ext:u32][flags:u16][len:u16][payload]
+    pub fn encode(&self) -> Vec<u8> {
+        let len = self.payload.len() as u16;
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len());
+        // Write header with version=0, checksum=0 for checksum computation
+        buf.extend_from_slice(&0u16.to_le_bytes());     // version (zeroed)
+        buf.extend_from_slice(&0u16.to_le_bytes());     // checksum (zeroed)
+        buf.extend_from_slice(&self.mesh_key.to_le_bytes());
+        buf.extend_from_slice(&self.ext.to_le_bytes());
+        buf.extend_from_slice(&self.flags.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&self.payload);
 
-    // ── Keepalive ──
-    Ping,
-    Pong,
+        let checksum = inet_checksum(&buf);
 
-    // ── Stream lifecycle (direct node-to-node streams via concentrator) ──
-    StreamOpen { stream_id: String, priority: u8 },
-    StreamClose { stream_id: String },
-    StreamQuench { stream_id: String },
-    StreamResume { stream_id: String },
+        buf[0..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        buf[2..4].copy_from_slice(&checksum.to_le_bytes());
+        buf
+    }
 
-    // ── Actor messages ──
-    Request { payload: Payload },
-    Response { payload: Payload },
+    /// Decode from wire bytes. Returns (frame, bytes_consumed).
+    pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < FRAME_HEADER_SIZE { return None; }
+
+        let version = u16::from_le_bytes([data[0], data[1]]);
+        let stored_csum = u16::from_le_bytes([data[2], data[3]]);
+        let mesh_key = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let ext = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let flags = u16::from_le_bytes([data[12], data[13]]);
+        let len = u16::from_le_bytes([data[14], data[15]]) as usize;
+
+        if version != PROTOCOL_VERSION { return None; }
+        let total = FRAME_HEADER_SIZE + len;
+        if data.len() < total { return None; }
+
+        // Verify checksum
+        let mut check = data[..total].to_vec();
+        check[0..2].copy_from_slice(&0u16.to_le_bytes());
+        check[2..4].copy_from_slice(&0u16.to_le_bytes());
+        if inet_checksum(&check) != stored_csum { return None; }
+
+        let payload = data[FRAME_HEADER_SIZE..total].to_vec();
+        Some((Self { mesh_key, ext, flags, payload }, total))
+    }
+
+    // ── Builders ──
+
+    /// JSONL fire-and-forget (no SYN/FIN).
+    pub fn jsonl(from: u16, to: u16, payload: &str) -> Self {
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_JSONL, payload: payload.as_bytes().to_vec() }
+    }
+
+    /// JSONL with in_reply_to.
+    pub fn jsonl_reply(from: u16, to: u16, irt: u16, payload: &str) -> Self {
+        Self { mesh_key: mesh_key(from, to), ext: ext_pack(0, irt), flags: FMT_JSONL, payload: payload.as_bytes().to_vec() }
+    }
+
+    /// Raw binary fire-and-forget.
+    pub fn raw(from: u16, to: u16, payload: Vec<u8>) -> Self {
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_RAW, payload }
+    }
+
+    /// SYN (stream open) with TTL.
+    pub fn syn(from: u16, to: u16, ttl: u8, payload: Vec<u8>) -> Self {
+        let flags = FMT_RAW | FLAG_SYN | ((ttl as u16 & 0xF) << TTL_SHIFT);
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags, payload }
+    }
+
+    /// FIN (stream close).
+    pub fn fin(from: u16, to: u16) -> Self {
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_FIN, payload: vec![] }
+    }
+
+    /// RST (abort).
+    pub fn rst(from: u16, to: u16) -> Self {
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_RST, payload: vec![] }
+    }
+
+    // ── Accessors ──
+
+    pub fn from_ep(&self) -> u16 { mesh_src(self.mesh_key) }
+    pub fn to_ep(&self) -> u16 { mesh_dst(self.mesh_key) }
+    pub fn from_node(&self) -> u8 { ep_node(self.from_ep()) }
+    pub fn to_node(&self) -> u8 { ep_node(self.to_ep()) }
+    pub fn from_service(&self) -> u16 { ep_service(self.from_ep()) }
+    pub fn to_service(&self) -> u16 { ep_service(self.to_ep()) }
+    pub fn format(&self) -> u16 { flags_format(self.flags) }
+    pub fn is_fin(&self) -> bool { flags_is_fin(self.flags) }
+    pub fn is_rst(&self) -> bool { flags_is_rst(self.flags) }
+    pub fn is_ack(&self) -> bool { flags_is_ack(self.flags) }
+    pub fn is_syn(&self) -> bool { flags_is_syn(self.flags) }
+    pub fn obo(&self) -> u16 { ext_obo(self.ext) }
+    pub fn in_reply_to(&self) -> u16 { ext_irt(self.ext) }
+    pub fn ttl(&self) -> u8 { flags_ttl(self.flags) }
+    pub fn ttl_seconds(&self) -> u32 { ttl_seconds(self.ttl()) }
+
+    pub fn to_debug_string(&self) -> String {
+        let fmt = match self.format() { 0 => "J", 1 => "B", 2 => "R", _ => "?" };
+        let mut flags_str = String::new();
+        if self.is_syn() { flags_str.push('S'); }
+        if self.is_fin() { flags_str.push('F'); }
+        if self.is_rst() { flags_str.push('R'); }
+        if self.is_ack() { flags_str.push('A'); }
+        format!("[{}/{} → {}/{} {}{}{} {}B]",
+            self.from_node(), self.from_service(),
+            self.to_node(), self.to_service(),
+            fmt, flags_str,
+            if self.in_reply_to() != 0 { format!(" irt={}", self.in_reply_to()) } else { String::new() },
+            self.payload.len())
+    }
 }
 
-/// Payload format for actor messages.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum Payload {
-    /// JSON string (e.g. `{"op":"infer","prompt":"..."}`)
-    Json(String),
-    /// Raw binary bytes (e.g. ScreenDiff, KeyInput, opaque data)
-    Binary(Vec<u8>),
+// ── ServiceHandle ────────────────────────────────────────────────────
+
+/// Lightweight handle to a remote service. Tracks message correlation.
+#[derive(Debug, Clone)]
+pub struct ServiceHandle {
+    pub local_ep: u16,
+    pub remote_ep: u16,
+    pub last_sent_id: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    pub last_recv_id: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
-/// An object advertised by a node (project, task, skill, etc).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+impl ServiceHandle {
+    pub fn new(local_ep: u16, remote_ep: u16) -> Self {
+        Self {
+            local_ep, remote_ep,
+            last_sent_id: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            last_recv_id: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        }
+    }
+
+    pub fn mesh_key(&self) -> u32 { mesh_key(self.local_ep, self.remote_ep) }
+
+    /// Build a F+F JSONL frame.
+    pub fn fire_json(&self, json: &str) -> Frame {
+        let id = self.next_id();
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, id), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+    }
+
+    /// Build a F+F raw binary frame.
+    pub fn fire_raw(&self, data: Vec<u8>) -> Frame {
+        Frame { mesh_key: self.mesh_key(), ext: 0, flags: FMT_RAW, payload: data }
+    }
+
+    /// Build a JSONL reply to last received message.
+    pub fn reply_json(&self, json: &str) -> Frame {
+        let irt = self.last_recv_id.load(std::sync::atomic::Ordering::Relaxed);
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, irt), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+    }
+
+    /// Build a reply with obo.
+    pub fn reply_json_obo(&self, obo: u16, json: &str) -> Frame {
+        let irt = self.last_recv_id.load(std::sync::atomic::Ordering::Relaxed);
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(obo, irt), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+    }
+
+    /// Record receipt of a frame from this service.
+    pub fn received(&self, frame: &Frame) {
+        self.last_recv_id.store(ext_irt(frame.ext), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn next_id(&self) -> u16 {
+        self.last_sent_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1)
+    }
+}
+
+// ── JSONL control message types (for stream 0) ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeObject {
     pub kind: String,
     pub id: String,
     pub label: String,
 }
 
-/// A peer node entry in NodeList.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeEntry {
     pub node_id: String,
+    pub numeric_id: u8,
     pub label: String,
     pub roles: u64,
     pub status: String,
     pub objects: Vec<NodeObject>,
 }
 
-// ── Address helpers ──────────────────────────────────────────────────
+// ── Checksum ─────────────────────────────────────────────────────────
 
-/// Parse `service@node-id` → (service, node-id). If no `@`, returns (input, "").
-pub fn parse_address(addr: &str) -> (&str, &str) {
-    match addr.split_once('@') {
-        Some((service, node)) => (service, node),
-        None => (addr, ""),
-    }
-}
-
-/// Build an address string.
-pub fn address(service: &str, node_id: &str) -> String {
-    if service.is_empty() {
-        format!("@{}", node_id)
-    } else {
-        format!("{}@{}", service, node_id)
-    }
-}
-
-// ── Codec ────────────────────────────────────────────────────────────
-
-impl Message {
-    /// Encode to bincode bytes (no frame header).
-    pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
-    }
-
-    /// Decode from bincode bytes.
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
-    }
-
-    /// Encode with frame header: [version:u32][checksum:u32][len:u32][bincode].
-    pub fn encode_framed(&self) -> Vec<u8> {
-        let body = self.encode();
-        let len = body.len() as u32;
-        let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + body.len());
-
-        // Build frame with all header fields zeroed for checksum computation
-        frame.extend_from_slice(&0u32.to_le_bytes()); // version (zeroed for checksum)
-        frame.extend_from_slice(&0u32.to_le_bytes()); // checksum (zeroed)
-        frame.extend_from_slice(&0u32.to_le_bytes()); // len (zeroed)
-        frame.extend_from_slice(&body);
-
-        let checksum = compute_checksum(&frame);
-
-        // Fill in actual header values
-        frame[0..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        frame[4..8].copy_from_slice(&checksum.to_le_bytes());
-        frame[8..12].copy_from_slice(&len.to_le_bytes());
-
-        frame
-    }
-
-    /// Decode a framed message. Returns (message, total_bytes_consumed).
-    pub fn decode_framed(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < FRAME_HEADER_SIZE {
-            return None;
-        }
-
-        let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let stored_checksum = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-
-        if version != PROTOCOL_VERSION {
-            return None;
-        }
-
-        let total = FRAME_HEADER_SIZE + len;
-        if data.len() < total {
-            return None;
-        }
-
-        // Verify checksum
-        let mut check_buf = data[..total].to_vec();
-        // Zero version, checksum, len for verification
-        check_buf[0..4].copy_from_slice(&0u32.to_le_bytes());
-        check_buf[4..8].copy_from_slice(&0u32.to_le_bytes());
-        check_buf[8..12].copy_from_slice(&0u32.to_le_bytes());
-        let computed = compute_checksum(&check_buf);
-        if computed != stored_checksum {
-            return None;
-        }
-
-        let msg = Self::decode(&data[FRAME_HEADER_SIZE..total])?;
-        Some((msg, total))
-    }
-
-    /// Human-readable debug string (id as base60).
-    pub fn to_debug_string(&self) -> String {
-        let id_str = id_to_base60(self.id);
-        let body_type = match &self.body {
-            Body::Ident { .. } => "Ident",
-            Body::NodeList { .. } => "NodeList",
-            Body::Ping => "Ping",
-            Body::Pong => "Pong",
-            Body::StreamOpen { .. } => "StreamOpen",
-            Body::StreamClose { .. } => "StreamClose",
-            Body::StreamQuench { .. } => "StreamQuench",
-            Body::StreamResume { .. } => "StreamResume",
-            Body::Request { payload } => match payload {
-                Payload::Json(_) => "Request/Json",
-                Payload::Binary(b) => return format!("[{}] {} → {} Request/Binary({}B)",
-                    id_str, self.from, self.to, b.len()),
-            },
-            Body::Response { payload } => match payload {
-                Payload::Json(_) => "Response/Json",
-                Payload::Binary(b) => return format!("[{}] {} → {} Response/Binary({}B)",
-                    id_str, self.from, self.to, b.len()),
-            },
-        };
-        format!("[{}] {} → {} {}", id_str, self.from, self.to, body_type)
-    }
-
-    /// The node that responses should go back to (obo if set, otherwise from).
-    pub fn reply_to(&self) -> &str {
-        self.obo.as_deref().unwrap_or(&self.from)
-    }
-}
-
-// ── Checksum (RFC 1071 internet checksum) ────────────────────────────
-
-fn compute_checksum(data: &[u8]) -> u32 {
+fn inet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
         sum += u16::from_le_bytes([data[i], data[i + 1]]) as u32;
         i += 2;
     }
-    if i < data.len() {
-        sum += data[i] as u32;
-    }
-    // Fold 32-bit sum to 16-bit with carry
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !sum & 0xFFFF
-}
-
-// ── ID display ───────────────────────────────────────────────────────
-
-fn id_to_base60(mut n: u32) -> String {
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz.~";
-    if n == 0 { return "0".into(); }
-    let base = ALPHABET.len() as u32;
-    let mut chars = Vec::with_capacity(6);
-    while n > 0 {
-        chars.push(ALPHABET[(n % base) as usize]);
-        n /= base;
-    }
-    chars.reverse();
-    String::from_utf8(chars).unwrap_or_else(|_| "?".into())
-}
-
-// ── Builder helpers ──────────────────────────────────────────────────
-
-static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
-fn next_id() -> u32 {
-    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-impl Message {
-    pub fn ident(node_id: &str, label: &str, roles: u64, objects: Vec<NodeObject>) -> Self {
-        Self {
-            id: next_id(),
-            from: address("", node_id),
-            to: "@conc".into(),
-            obo: None,
-            body: Body::Ident {
-                node_id: node_id.into(),
-                label: label.into(),
-                roles,
-                objects,
-            },
-        }
-    }
-
-    pub fn ping(from: &str) -> Self {
-        Self { id: next_id(), from: from.into(), to: "@conc".into(), obo: None, body: Body::Ping }
-    }
-
-    pub fn pong(from: &str, to: &str) -> Self {
-        Self { id: next_id(), from: from.into(), to: to.into(), obo: None, body: Body::Pong }
-    }
-
-    pub fn request_json(from: &str, to: &str, json: &str) -> Self {
-        Self {
-            id: next_id(), from: from.into(), to: to.into(), obo: None,
-            body: Body::Request { payload: Payload::Json(json.into()) },
-        }
-    }
-
-    pub fn request_binary(from: &str, to: &str, data: Vec<u8>) -> Self {
-        Self {
-            id: next_id(), from: from.into(), to: to.into(), obo: None,
-            body: Body::Request { payload: Payload::Binary(data) },
-        }
-    }
-
-    pub fn response_json(id: u32, from: &str, to: &str, json: &str) -> Self {
-        Self {
-            id, from: from.into(), to: to.into(), obo: None,
-            body: Body::Response { payload: Payload::Json(json.into()) },
-        }
-    }
-
-    pub fn response_binary(id: u32, from: &str, to: &str, data: Vec<u8>) -> Self {
-        Self {
-            id, from: from.into(), to: to.into(), obo: None,
-            body: Body::Response { payload: Payload::Binary(data) },
-        }
-    }
-
-    pub fn stream_open(from: &str, to: &str, stream_id: &str, priority: u8) -> Self {
-        Self {
-            id: next_id(), from: from.into(), to: to.into(), obo: None,
-            body: Body::StreamOpen { stream_id: stream_id.into(), priority },
-        }
-    }
-
-    pub fn stream_close(from: &str, to: &str, stream_id: &str) -> Self {
-        Self {
-            id: next_id(), from: from.into(), to: to.into(), obo: None,
-            body: Body::StreamClose { stream_id: stream_id.into() },
-        }
-    }
-}
-
-// ── Stream frame header ──────────────────────────────────────────────
-//
-// For data streams (yamux streams 1+). One u32 packs everything:
-//
-//   [format:1][flags:7][seq:16][reserved:8]
-//
-//   Bits 31:    format    0=JSONL, 1=Binary
-//   Bits 30-24: flags     FIN=0x40, RST=0x20, ACK=0x10, SYN=0x08
-//   Bits 23-8:  seq       u16 sequence number (wraps)
-//   Bits 7-0:   reserved  (future: priority, type code, etc.)
-//
-// Wire format per stream frame:
-//   [header: u32 LE][len: u32 LE][payload: bytes]
-
-pub const STREAM_FRAME_HEADER_SIZE: usize = 8; // header(4) + len(4)
-
-// Format bit
-pub const SF_BINARY: u32 = 1 << 31;
-pub const SF_JSONL:  u32 = 0;
-
-// Flag bits (TCP-like)
-pub const SF_FIN:   u32 = 1 << 30;  // last frame, stream self-closes
-pub const SF_RST:   u32 = 1 << 29;  // abort stream
-pub const SF_ACK:   u32 = 1 << 28;  // acknowledges receipt
-pub const SF_SYN:   u32 = 1 << 27;  // stream open (first frame)
-pub const SF_DGRAM: u32 = 1 << 26;  // datagram — fire-and-forget, no SYN/FIN needed
-
-/// Pack a stream frame header.
-pub fn sf_pack(format: u32, flags: u32, seq: u16) -> u32 {
-    format | flags | ((seq as u32) << 8)
-}
-
-/// Unpack format bit.
-pub fn sf_format(header: u32) -> u32 { header & SF_BINARY }
-
-/// Unpack flags.
-pub fn sf_flags(header: u32) -> u32 { header & 0x7F00_0000 }
-
-/// Unpack sequence number.
-pub fn sf_seq(header: u32) -> u16 { ((header >> 8) & 0xFFFF) as u16 }
-
-/// Check individual flags.
-pub fn sf_is_fin(header: u32) -> bool { header & SF_FIN != 0 }
-pub fn sf_is_rst(header: u32) -> bool { header & SF_RST != 0 }
-pub fn sf_is_ack(header: u32) -> bool { header & SF_ACK != 0 }
-pub fn sf_is_syn(header: u32) -> bool { header & SF_SYN != 0 }
-pub fn sf_is_dgram(header: u32) -> bool { header & SF_DGRAM != 0 }
-pub fn sf_is_binary(header: u32) -> bool { header & SF_BINARY != 0 }
-
-/// A decoded stream frame.
-#[derive(Debug, Clone)]
-pub struct StreamFrame {
-    pub header: u32,
-    pub payload: Vec<u8>,
-}
-
-impl StreamFrame {
-    /// Create a binary data frame.
-    pub fn binary(seq: u16, data: Vec<u8>) -> Self {
-        Self { header: sf_pack(SF_BINARY, 0, seq), payload: data }
-    }
-
-    /// Create a binary data frame with FIN (self-closing).
-    pub fn binary_fin(seq: u16, data: Vec<u8>) -> Self {
-        Self { header: sf_pack(SF_BINARY, SF_FIN, seq), payload: data }
-    }
-
-    /// Create a JSONL data frame.
-    pub fn json(seq: u16, json: &str) -> Self {
-        Self { header: sf_pack(SF_JSONL, 0, seq), payload: json.as_bytes().to_vec() }
-    }
-
-    /// Create a JSONL data frame with FIN.
-    pub fn json_fin(seq: u16, json: &str) -> Self {
-        Self { header: sf_pack(SF_JSONL, SF_FIN, seq), payload: json.as_bytes().to_vec() }
-    }
-
-    /// Create a SYN frame (stream open).
-    pub fn syn(seq: u16, payload: Vec<u8>) -> Self {
-        Self { header: sf_pack(SF_BINARY, SF_SYN, seq), payload }
-    }
-
-    /// Create a FIN frame (stream close, no data).
-    pub fn fin(seq: u16) -> Self {
-        Self { header: sf_pack(0, SF_FIN, seq), payload: vec![] }
-    }
-
-    /// Create a RST frame (abort).
-    pub fn rst(seq: u16) -> Self {
-        Self { header: sf_pack(0, SF_RST, seq), payload: vec![] }
-    }
-
-    /// Create a binary datagram — fire-and-forget, no stream needed.
-    /// Sent on stream 0 alongside control messages. Routed by the concentrator
-    /// using the Message envelope's `to` field.
-    pub fn dgram_binary(data: Vec<u8>) -> Self {
-        Self { header: sf_pack(SF_BINARY, SF_DGRAM, 0), payload: data }
-    }
-
-    /// Create a JSON datagram.
-    pub fn dgram_json(json: &str) -> Self {
-        Self { header: sf_pack(SF_JSONL, SF_DGRAM, 0), payload: json.as_bytes().to_vec() }
-    }
-
-    /// Encode to bytes: [header:u32 LE][len:u32 LE][payload].
-    pub fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len() as u32;
-        let mut buf = Vec::with_capacity(STREAM_FRAME_HEADER_SIZE + self.payload.len());
-        buf.extend_from_slice(&self.header.to_le_bytes());
-        buf.extend_from_slice(&len.to_le_bytes());
-        buf.extend_from_slice(&self.payload);
-        buf
-    }
-
-    /// Decode from bytes. Returns (frame, bytes_consumed).
-    pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < STREAM_FRAME_HEADER_SIZE { return None; }
-        let header = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        let total = STREAM_FRAME_HEADER_SIZE + len;
-        if data.len() < total { return None; }
-        let payload = data[STREAM_FRAME_HEADER_SIZE..total].to_vec();
-        Some((Self { header, payload }, total))
-    }
-
-    pub fn is_fin(&self) -> bool { sf_is_fin(self.header) }
-    pub fn is_rst(&self) -> bool { sf_is_rst(self.header) }
-    pub fn is_syn(&self) -> bool { sf_is_syn(self.header) }
-    pub fn is_dgram(&self) -> bool { sf_is_dgram(self.header) }
-    pub fn is_binary(&self) -> bool { sf_is_binary(self.header) }
-    pub fn seq(&self) -> u16 { sf_seq(self.header) }
+    if i < data.len() { sum += data[i] as u32; }
+    while sum > 0xFFFF { sum = (sum & 0xFFFF) + (sum >> 16); }
+    (!sum & 0xFFFF) as u16
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -458,214 +324,136 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bincode_roundtrip() {
-        let msg = Message::request_json("@tui", "fast_thinker", r#"{"op":"infer","prompt":"hello"}"#);
-        let encoded = msg.encode();
-        let decoded = Message::decode(&encoded).unwrap();
-        assert_eq!(decoded.from, "@tui");
-        assert_eq!(decoded.to, "fast_thinker");
-        match decoded.body {
-            Body::Request { payload: Payload::Json(s) } => assert!(s.contains("infer")),
-            _ => panic!("wrong body"),
-        }
+    fn endpoint_pack_unpack() {
+        let ep = endpoint(5, SVC_FAST_THINKER);
+        assert_eq!(ep_node(ep), 5);
+        assert_eq!(ep_service(ep), SVC_FAST_THINKER);
+
+        let ep2 = endpoint(NODE_BROADCAST, 1023);
+        assert_eq!(ep_node(ep2), NODE_BROADCAST);
+        assert_eq!(ep_service(ep2), 1023);
     }
 
     #[test]
-    fn framed_roundtrip() {
-        let msg = Message::ident("21dda674-rs", "mac-mini", 0x1c, vec![
-            NodeObject { kind: "project".into(), id: "p1".into(), label: "test".into() },
-        ]);
-        let framed = msg.encode_framed();
-        assert!(framed.len() >= FRAME_HEADER_SIZE);
-
-        let (decoded, consumed) = Message::decode_framed(&framed).unwrap();
-        assert_eq!(consumed, framed.len());
-        assert_eq!(decoded.to, "@conc");
-        match decoded.body {
-            Body::Ident { node_id, roles, .. } => {
-                assert_eq!(node_id, "21dda674-rs");
-                assert_eq!(roles, 0x1c);
-            }
-            _ => panic!("wrong body"),
-        }
+    fn mesh_key_pack_unpack() {
+        let src = endpoint(2, SVC_FAST_THINKER);
+        let dst = endpoint(5, SVC_PROCESS_ENGINE);
+        let key = mesh_key(src, dst);
+        assert_eq!(mesh_src(key), src);
+        assert_eq!(mesh_dst(key), dst);
     }
 
     #[test]
-    fn checksum_detects_corruption() {
-        let msg = Message::ping("@test");
-        let mut framed = msg.encode_framed();
-        // Corrupt one byte in the body
-        if let Some(b) = framed.last_mut() { *b ^= 0xFF; }
-        assert!(Message::decode_framed(&framed).is_none());
+    fn frame_jsonl_roundtrip() {
+        let f = Frame::jsonl(endpoint(1, SVC_NODE), endpoint(2, SVC_FAST_THINKER),
+            r#"{"op":"infer","prompt":"hello"}"#);
+        let encoded = f.encode();
+        assert!(encoded.len() >= FRAME_HEADER_SIZE);
+        let (decoded, consumed) = Frame::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.from_node(), 1);
+        assert_eq!(decoded.to_service(), SVC_FAST_THINKER);
+        assert_eq!(decoded.format(), 0); // JSONL
+        assert_eq!(std::str::from_utf8(&decoded.payload).unwrap(), r#"{"op":"infer","prompt":"hello"}"#);
     }
 
     #[test]
-    fn binary_payload_roundtrip() {
-        let data = vec![0u8, 1, 2, 3, 255, 254, 253];
-        let msg = Message::request_binary("@a", "@b", data.clone());
-        let framed = msg.encode_framed();
-        let (decoded, _) = Message::decode_framed(&framed).unwrap();
-        match decoded.body {
-            Body::Request { payload: Payload::Binary(d) } => assert_eq!(d, data),
-            _ => panic!("wrong body"),
-        }
+    fn frame_raw_binary_roundtrip() {
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let f = Frame::raw(endpoint(3, SVC_TERMINAL), endpoint(4, SVC_DISPLAY), data.clone());
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.format(), 2); // raw
+        assert_eq!(decoded.payload, data);
     }
 
     #[test]
-    fn address_parse() {
-        assert_eq!(parse_address("process_engine@21dda674-rs"), ("process_engine", "21dda674-rs"));
-        assert_eq!(parse_address("@21dda674-rs"), ("", "21dda674-rs"));
-        assert_eq!(parse_address("fast_thinker"), ("fast_thinker", ""));
-        assert_eq!(parse_address("@*"), ("", "*"));
-        assert_eq!(parse_address("@conc"), ("", "conc"));
+    fn frame_syn_with_ttl() {
+        let f = Frame::syn(endpoint(1, 0), endpoint(2, SVC_TERMINAL), 8, vec![]); // TTL=1hr
+        assert!(f.is_syn());
+        assert_eq!(f.ttl(), 8);
+        assert_eq!(f.ttl_seconds(), 3600);
+
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert!(decoded.is_syn());
+        assert_eq!(decoded.ttl_seconds(), 3600);
     }
 
     #[test]
-    fn address_build() {
-        assert_eq!(address("process_engine", "21dda674-rs"), "process_engine@21dda674-rs");
-        assert_eq!(address("", "21dda674-rs"), "@21dda674-rs");
+    fn frame_fin_rst() {
+        let fin = Frame::fin(endpoint(1, 0), endpoint(2, 0));
+        assert!(fin.is_fin());
+        assert!(!fin.is_rst());
+
+        let rst = Frame::rst(endpoint(1, 0), endpoint(2, 0));
+        assert!(rst.is_rst());
+        assert!(!rst.is_fin());
+    }
+
+    #[test]
+    fn frame_checksum_corruption() {
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "test");
+        let mut encoded = f.encode();
+        if let Some(b) = encoded.last_mut() { *b ^= 0xFF; }
+        assert!(Frame::decode(&encoded).is_none());
+    }
+
+    #[test]
+    fn ext_obo_irt() {
+        let f = Frame::jsonl_reply(endpoint(1, 0), endpoint(2, 0), 42, "reply");
+        assert_eq!(f.in_reply_to(), 42);
+        assert_eq!(f.obo(), 0);
+
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.in_reply_to(), 42);
+    }
+
+    #[test]
+    fn service_handle_fire_reply() {
+        let h = ServiceHandle::new(endpoint(1, SVC_NODE), endpoint(2, SVC_FAST_THINKER));
+        let f1 = h.fire_json(r#"{"op":"status"}"#);
+        assert_eq!(f1.from_node(), 1);
+        assert_eq!(f1.to_service(), SVC_FAST_THINKER);
+
+        // Simulate receiving a reply
+        let reply = Frame::jsonl_reply(endpoint(2, SVC_FAST_THINKER), endpoint(1, SVC_NODE), 1, "ok");
+        h.received(&reply);
+
+        let f2 = h.reply_json(r#"{"ack":true}"#);
+        assert_eq!(f2.in_reply_to(), 1); // correlates to the received frame
+    }
+
+    #[test]
+    fn role_svc_conversion() {
+        assert_eq!(svc_to_role(SVC_FAST_THINKER), ROLE_FAST_THINKER);
+        assert_eq!(role_to_svc(ROLE_FAST_THINKER), SVC_FAST_THINKER);
+        assert_eq!(svc_to_role(SVC_NODE), ROLE_NODE);
+        assert_eq!(svc_to_role(SVC_DISPLAY), ROLE_DISPLAY);
+    }
+
+    #[test]
+    fn resolve_endpoint() {
+        let ep = endpoint(NODE_RESOLVE, SVC_FAST_THINKER);
+        assert_eq!(ep_node(ep), NODE_RESOLVE);
+        assert_eq!(ep_service(ep), SVC_FAST_THINKER);
+    }
+
+    #[test]
+    fn frame_incomplete() {
+        assert!(Frame::decode(&[0; 15]).is_none()); // less than header
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "test");
+        let encoded = f.encode();
+        assert!(Frame::decode(&encoded[..FRAME_HEADER_SIZE]).is_none()); // header but no payload
     }
 
     #[test]
     fn debug_string() {
-        let msg = Message::request_json("@tui", "fast_thinker", "{}");
-        let s = msg.to_debug_string();
-        assert!(s.contains("@tui"));
-        assert!(s.contains("fast_thinker"));
-        assert!(s.contains("Request/Json"));
-    }
-
-    #[test]
-    fn id_base60_display() {
-        assert_eq!(id_to_base60(0), "0");
-        assert_eq!(id_to_base60(1), "1");
-        let s = id_to_base60(123456);
-        assert!(!s.is_empty());
-        assert!(s.len() <= 4); // 123456 fits in ~3 base60 digits
-    }
-
-    #[test]
-    fn stream_lifecycle_roundtrip() {
-        let msg = Message::stream_open("@tui", "@rs", "stream-abc@conc", 0);
-        let framed = msg.encode_framed();
-        let (decoded, _) = Message::decode_framed(&framed).unwrap();
-        match decoded.body {
-            Body::StreamOpen { stream_id, priority } => {
-                assert_eq!(stream_id, "stream-abc@conc");
-                assert_eq!(priority, 0);
-            }
-            _ => panic!("wrong body"),
-        }
-    }
-
-    #[test]
-    fn incomplete_frame_returns_none() {
-        let msg = Message::ping("@test");
-        let framed = msg.encode_framed();
-        // Truncate
-        assert!(Message::decode_framed(&framed[..FRAME_HEADER_SIZE - 1]).is_none());
-        assert!(Message::decode_framed(&framed[..FRAME_HEADER_SIZE]).is_none()); // no body
-    }
-
-    // ── Stream frame tests ──
-
-    #[test]
-    fn stream_frame_binary_roundtrip() {
-        let data = vec![1u8, 2, 3, 4, 5];
-        let frame = StreamFrame::binary(42, data.clone());
-        assert!(frame.is_binary());
-        assert!(!frame.is_fin());
-        assert_eq!(frame.seq(), 42);
-
-        let encoded = frame.encode();
-        let (decoded, consumed) = StreamFrame::decode(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded.payload, data);
-        assert_eq!(decoded.seq(), 42);
-        assert!(decoded.is_binary());
-    }
-
-    #[test]
-    fn stream_frame_fin_self_closes() {
-        let frame = StreamFrame::binary_fin(100, vec![0xFF]);
-        assert!(frame.is_fin());
-        assert!(frame.is_binary());
-        assert_eq!(frame.seq(), 100);
-    }
-
-    #[test]
-    fn stream_frame_json_roundtrip() {
-        let json = r#"{"op":"infer","prompt":"hello"}"#;
-        let frame = StreamFrame::json(7, json);
-        assert!(!frame.is_binary());
-        assert_eq!(frame.seq(), 7);
-
-        let encoded = frame.encode();
-        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
-        assert_eq!(std::str::from_utf8(&decoded.payload).unwrap(), json);
-    }
-
-    #[test]
-    fn stream_frame_syn_rst() {
-        let syn = StreamFrame::syn(0, b"task-abc".to_vec());
-        assert!(syn.is_syn());
-        assert!(!syn.is_fin());
-
-        let rst = StreamFrame::rst(5);
-        assert!(rst.is_rst());
-        assert!(rst.payload.is_empty());
-    }
-
-    #[test]
-    fn stream_frame_header_packing() {
-        // Binary + FIN + seq=0xABCD
-        let h = sf_pack(SF_BINARY, SF_FIN, 0xABCD);
-        assert!(sf_is_binary(h));
-        assert!(sf_is_fin(h));
-        assert!(!sf_is_rst(h));
-        assert!(!sf_is_syn(h));
-        assert_eq!(sf_seq(h), 0xABCD);
-    }
-
-    #[test]
-    fn stream_frame_seq_wraps() {
-        let frame = StreamFrame::binary(u16::MAX, vec![]);
-        assert_eq!(frame.seq(), u16::MAX);
-        let frame2 = StreamFrame::binary(0, vec![]);
-        assert_eq!(frame2.seq(), 0);
-    }
-
-    #[test]
-    fn stream_frame_dgram() {
-        let dg = StreamFrame::dgram_json(r#"{"status":"processing","task_id":"abc"}"#);
-        assert!(dg.is_dgram());
-        assert!(!dg.is_binary());
-        assert!(!dg.is_fin());
-        assert!(!dg.is_syn());
-        assert_eq!(dg.seq(), 0);
-
-        let encoded = dg.encode();
-        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
-        assert!(decoded.is_dgram());
-        assert_eq!(std::str::from_utf8(&decoded.payload).unwrap(), r#"{"status":"processing","task_id":"abc"}"#);
-    }
-
-    #[test]
-    fn stream_frame_dgram_binary() {
-        let dg = StreamFrame::dgram_binary(vec![0xDE, 0xAD]);
-        assert!(dg.is_dgram());
-        assert!(dg.is_binary());
-        let encoded = dg.encode();
-        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
-        assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
-    }
-
-    #[test]
-    fn stream_frame_incomplete_decode() {
-        let frame = StreamFrame::binary(1, vec![1, 2, 3]);
-        let encoded = frame.encode();
-        // Truncate
-        assert!(StreamFrame::decode(&encoded[..7]).is_none()); // less than header
-        assert!(StreamFrame::decode(&encoded[..9]).is_none()); // less than header+payload
+        let f = Frame::syn(endpoint(1, SVC_NODE), endpoint(2, SVC_TERMINAL), 5, b"hello".to_vec());
+        let s = f.to_debug_string();
+        assert!(s.contains("1/0"));
+        assert!(s.contains("2/9"));
+        assert!(s.contains("S")); // SYN flag
     }
 }
