@@ -64,6 +64,63 @@ pub const fn mesh_key(src: u16, dst: u16) -> u32 { ((src as u32) << 16) | (dst a
 pub const fn mesh_src(key: u32) -> u16 { (key >> 16) as u16 }
 pub const fn mesh_dst(key: u32) -> u16 { key as u16 }
 
+// ── Endpoint display/parse (universal alias) ─────────────────────────
+
+const EP_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz.~";
+
+/// Display an endpoint as a short base58-like string (2-3 chars for u16).
+pub fn ep_display(ep: u16) -> String {
+    let base = EP_ALPHABET.len() as u16;
+    if ep == 0 { return "0".into(); }
+    let mut n = ep;
+    let mut chars = Vec::with_capacity(3);
+    while n > 0 {
+        chars.push(EP_ALPHABET[(n % base) as usize]);
+        n /= base;
+    }
+    chars.reverse();
+    String::from_utf8(chars).unwrap_or_else(|_| format!("{:04x}", ep))
+}
+
+/// Parse a base58 string back to endpoint u16. Also accepts hex with "0x" prefix.
+pub fn ep_parse(s: &str) -> Option<u16> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        return u16::from_str_radix(hex, 16).ok();
+    }
+    let base = EP_ALPHABET.len() as u16;
+    let mut result: u16 = 0;
+    for &b in s.as_bytes() {
+        let digit = EP_ALPHABET.iter().position(|&c| c == b)? as u16;
+        result = result.checked_mul(base)?.checked_add(digit)?;
+    }
+    Some(result)
+}
+
+/// Format an endpoint for human display: "node/svc" or well-known name.
+pub fn ep_label(ep: u16) -> String {
+    let node = ep_node(ep);
+    let svc = ep_service(ep);
+    let svc_name = match svc {
+        SVC_NODE => "node",
+        SVC_FAST_THINKER => "fast_thinker",
+        SVC_DEEP_THINKER => "deep_thinker",
+        SVC_PROCESS_ENGINE => "process_engine",
+        SVC_REPO_HOST => "repo_host",
+        SVC_CODER_HOST => "coder_host",
+        SVC_VOICE_PROCESSOR => "voice_processor",
+        SVC_PROMPT_PROCESSOR => "prompt_processor",
+        SVC_HEURISTIC_ROUTER => "heuristic_router",
+        SVC_TERMINAL => "terminal",
+        SVC_ASR => "asr",
+        SVC_DISPLAY => "display",
+        _ => return format!("{}/{}", node, svc),
+    };
+    if node == NODE_CONC { return format!("conc/{}", svc_name); }
+    if node == NODE_RESOLVE { return format!("?/{}", svc_name); }
+    if node == NODE_BROADCAST { return format!("*/{}", svc_name); }
+    format!("{}/{}", node, svc_name)
+}
+
 // ── Flags (u16) ──────────────────────────────────────────────────────
 
 // Format (bits 15-13)
@@ -341,6 +398,30 @@ mod tests {
         let key = mesh_key(src, dst);
         assert_eq!(mesh_src(key), src);
         assert_eq!(mesh_dst(key), dst);
+    }
+
+    #[test]
+    fn ep_display_parse_roundtrip() {
+        for ep in [0u16, 1, 42, 1023, endpoint(5, SVC_FAST_THINKER), endpoint(NODE_BROADCAST, 1023)] {
+            let s = ep_display(ep);
+            let parsed = ep_parse(&s).unwrap();
+            assert_eq!(parsed, ep, "roundtrip failed for ep={}: display='{}' parsed={}", ep, s, parsed);
+        }
+    }
+
+    #[test]
+    fn ep_parse_hex() {
+        assert_eq!(ep_parse("0x0401"), Some(endpoint(1, 1)));
+        assert_eq!(ep_parse("0x0000"), Some(0));
+        assert_eq!(ep_parse("0xFFFF"), Some(u16::MAX));
+    }
+
+    #[test]
+    fn ep_label_well_known() {
+        assert_eq!(ep_label(endpoint(3, SVC_FAST_THINKER)), "3/fast_thinker");
+        assert_eq!(ep_label(endpoint(NODE_CONC, SVC_NODE)), "conc/node");
+        assert_eq!(ep_label(endpoint(NODE_RESOLVE, SVC_TERMINAL)), "?/terminal");
+        assert_eq!(ep_label(endpoint(5, 100)), "5/100"); // dynamic
     }
 
     #[test]
