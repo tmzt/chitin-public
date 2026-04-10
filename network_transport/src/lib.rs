@@ -318,6 +318,124 @@ impl Message {
     }
 }
 
+// ── Stream frame header ──────────────────────────────────────────────
+//
+// For data streams (yamux streams 1+). One u32 packs everything:
+//
+//   [format:1][flags:7][seq:16][reserved:8]
+//
+//   Bits 31:    format    0=JSONL, 1=Binary
+//   Bits 30-24: flags     FIN=0x40, RST=0x20, ACK=0x10, SYN=0x08
+//   Bits 23-8:  seq       u16 sequence number (wraps)
+//   Bits 7-0:   reserved  (future: priority, type code, etc.)
+//
+// Wire format per stream frame:
+//   [header: u32 LE][len: u32 LE][payload: bytes]
+
+pub const STREAM_FRAME_HEADER_SIZE: usize = 8; // header(4) + len(4)
+
+// Format bit
+pub const SF_BINARY: u32 = 1 << 31;
+pub const SF_JSONL:  u32 = 0;
+
+// Flag bits (TCP-like)
+pub const SF_FIN: u32 = 1 << 30;  // last frame, stream self-closes
+pub const SF_RST: u32 = 1 << 29;  // abort stream
+pub const SF_ACK: u32 = 1 << 28;  // acknowledges receipt
+pub const SF_SYN: u32 = 1 << 27;  // stream open (first frame)
+
+/// Pack a stream frame header.
+pub fn sf_pack(format: u32, flags: u32, seq: u16) -> u32 {
+    format | flags | ((seq as u32) << 8)
+}
+
+/// Unpack format bit.
+pub fn sf_format(header: u32) -> u32 { header & SF_BINARY }
+
+/// Unpack flags.
+pub fn sf_flags(header: u32) -> u32 { header & 0x7F00_0000 }
+
+/// Unpack sequence number.
+pub fn sf_seq(header: u32) -> u16 { ((header >> 8) & 0xFFFF) as u16 }
+
+/// Check individual flags.
+pub fn sf_is_fin(header: u32) -> bool { header & SF_FIN != 0 }
+pub fn sf_is_rst(header: u32) -> bool { header & SF_RST != 0 }
+pub fn sf_is_ack(header: u32) -> bool { header & SF_ACK != 0 }
+pub fn sf_is_syn(header: u32) -> bool { header & SF_SYN != 0 }
+pub fn sf_is_binary(header: u32) -> bool { header & SF_BINARY != 0 }
+
+/// A decoded stream frame.
+#[derive(Debug, Clone)]
+pub struct StreamFrame {
+    pub header: u32,
+    pub payload: Vec<u8>,
+}
+
+impl StreamFrame {
+    /// Create a binary data frame.
+    pub fn binary(seq: u16, data: Vec<u8>) -> Self {
+        Self { header: sf_pack(SF_BINARY, 0, seq), payload: data }
+    }
+
+    /// Create a binary data frame with FIN (self-closing).
+    pub fn binary_fin(seq: u16, data: Vec<u8>) -> Self {
+        Self { header: sf_pack(SF_BINARY, SF_FIN, seq), payload: data }
+    }
+
+    /// Create a JSONL data frame.
+    pub fn json(seq: u16, json: &str) -> Self {
+        Self { header: sf_pack(SF_JSONL, 0, seq), payload: json.as_bytes().to_vec() }
+    }
+
+    /// Create a JSONL data frame with FIN.
+    pub fn json_fin(seq: u16, json: &str) -> Self {
+        Self { header: sf_pack(SF_JSONL, SF_FIN, seq), payload: json.as_bytes().to_vec() }
+    }
+
+    /// Create a SYN frame (stream open).
+    pub fn syn(seq: u16, payload: Vec<u8>) -> Self {
+        Self { header: sf_pack(SF_BINARY, SF_SYN, seq), payload }
+    }
+
+    /// Create a FIN frame (stream close, no data).
+    pub fn fin(seq: u16) -> Self {
+        Self { header: sf_pack(0, SF_FIN, seq), payload: vec![] }
+    }
+
+    /// Create a RST frame (abort).
+    pub fn rst(seq: u16) -> Self {
+        Self { header: sf_pack(0, SF_RST, seq), payload: vec![] }
+    }
+
+    /// Encode to bytes: [header:u32 LE][len:u32 LE][payload].
+    pub fn encode(&self) -> Vec<u8> {
+        let len = self.payload.len() as u32;
+        let mut buf = Vec::with_capacity(STREAM_FRAME_HEADER_SIZE + self.payload.len());
+        buf.extend_from_slice(&self.header.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    /// Decode from bytes. Returns (frame, bytes_consumed).
+    pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < STREAM_FRAME_HEADER_SIZE { return None; }
+        let header = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let total = STREAM_FRAME_HEADER_SIZE + len;
+        if data.len() < total { return None; }
+        let payload = data[STREAM_FRAME_HEADER_SIZE..total].to_vec();
+        Some((Self { header, payload }, total))
+    }
+
+    pub fn is_fin(&self) -> bool { sf_is_fin(self.header) }
+    pub fn is_rst(&self) -> bool { sf_is_rst(self.header) }
+    pub fn is_syn(&self) -> bool { sf_is_syn(self.header) }
+    pub fn is_binary(&self) -> bool { sf_is_binary(self.header) }
+    pub fn seq(&self) -> u16 { sf_seq(self.header) }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -432,5 +550,82 @@ mod tests {
         // Truncate
         assert!(Message::decode_framed(&framed[..FRAME_HEADER_SIZE - 1]).is_none());
         assert!(Message::decode_framed(&framed[..FRAME_HEADER_SIZE]).is_none()); // no body
+    }
+
+    // ── Stream frame tests ──
+
+    #[test]
+    fn stream_frame_binary_roundtrip() {
+        let data = vec![1u8, 2, 3, 4, 5];
+        let frame = StreamFrame::binary(42, data.clone());
+        assert!(frame.is_binary());
+        assert!(!frame.is_fin());
+        assert_eq!(frame.seq(), 42);
+
+        let encoded = frame.encode();
+        let (decoded, consumed) = StreamFrame::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.payload, data);
+        assert_eq!(decoded.seq(), 42);
+        assert!(decoded.is_binary());
+    }
+
+    #[test]
+    fn stream_frame_fin_self_closes() {
+        let frame = StreamFrame::binary_fin(100, vec![0xFF]);
+        assert!(frame.is_fin());
+        assert!(frame.is_binary());
+        assert_eq!(frame.seq(), 100);
+    }
+
+    #[test]
+    fn stream_frame_json_roundtrip() {
+        let json = r#"{"op":"infer","prompt":"hello"}"#;
+        let frame = StreamFrame::json(7, json);
+        assert!(!frame.is_binary());
+        assert_eq!(frame.seq(), 7);
+
+        let encoded = frame.encode();
+        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded.payload).unwrap(), json);
+    }
+
+    #[test]
+    fn stream_frame_syn_rst() {
+        let syn = StreamFrame::syn(0, b"task-abc".to_vec());
+        assert!(syn.is_syn());
+        assert!(!syn.is_fin());
+
+        let rst = StreamFrame::rst(5);
+        assert!(rst.is_rst());
+        assert!(rst.payload.is_empty());
+    }
+
+    #[test]
+    fn stream_frame_header_packing() {
+        // Binary + FIN + seq=0xABCD
+        let h = sf_pack(SF_BINARY, SF_FIN, 0xABCD);
+        assert!(sf_is_binary(h));
+        assert!(sf_is_fin(h));
+        assert!(!sf_is_rst(h));
+        assert!(!sf_is_syn(h));
+        assert_eq!(sf_seq(h), 0xABCD);
+    }
+
+    #[test]
+    fn stream_frame_seq_wraps() {
+        let frame = StreamFrame::binary(u16::MAX, vec![]);
+        assert_eq!(frame.seq(), u16::MAX);
+        let frame2 = StreamFrame::binary(0, vec![]);
+        assert_eq!(frame2.seq(), 0);
+    }
+
+    #[test]
+    fn stream_frame_incomplete_decode() {
+        let frame = StreamFrame::binary(1, vec![1, 2, 3]);
+        let encoded = frame.encode();
+        // Truncate
+        assert!(StreamFrame::decode(&encoded[..7]).is_none()); // less than header
+        assert!(StreamFrame::decode(&encoded[..9]).is_none()); // less than header+payload
     }
 }
