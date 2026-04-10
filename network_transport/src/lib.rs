@@ -339,10 +339,11 @@ pub const SF_BINARY: u32 = 1 << 31;
 pub const SF_JSONL:  u32 = 0;
 
 // Flag bits (TCP-like)
-pub const SF_FIN: u32 = 1 << 30;  // last frame, stream self-closes
-pub const SF_RST: u32 = 1 << 29;  // abort stream
-pub const SF_ACK: u32 = 1 << 28;  // acknowledges receipt
-pub const SF_SYN: u32 = 1 << 27;  // stream open (first frame)
+pub const SF_FIN:   u32 = 1 << 30;  // last frame, stream self-closes
+pub const SF_RST:   u32 = 1 << 29;  // abort stream
+pub const SF_ACK:   u32 = 1 << 28;  // acknowledges receipt
+pub const SF_SYN:   u32 = 1 << 27;  // stream open (first frame)
+pub const SF_DGRAM: u32 = 1 << 26;  // datagram — fire-and-forget, no SYN/FIN needed
 
 /// Pack a stream frame header.
 pub fn sf_pack(format: u32, flags: u32, seq: u16) -> u32 {
@@ -363,6 +364,7 @@ pub fn sf_is_fin(header: u32) -> bool { header & SF_FIN != 0 }
 pub fn sf_is_rst(header: u32) -> bool { header & SF_RST != 0 }
 pub fn sf_is_ack(header: u32) -> bool { header & SF_ACK != 0 }
 pub fn sf_is_syn(header: u32) -> bool { header & SF_SYN != 0 }
+pub fn sf_is_dgram(header: u32) -> bool { header & SF_DGRAM != 0 }
 pub fn sf_is_binary(header: u32) -> bool { header & SF_BINARY != 0 }
 
 /// A decoded stream frame.
@@ -408,6 +410,18 @@ impl StreamFrame {
         Self { header: sf_pack(0, SF_RST, seq), payload: vec![] }
     }
 
+    /// Create a binary datagram — fire-and-forget, no stream needed.
+    /// Sent on stream 0 alongside control messages. Routed by the concentrator
+    /// using the Message envelope's `to` field.
+    pub fn dgram_binary(data: Vec<u8>) -> Self {
+        Self { header: sf_pack(SF_BINARY, SF_DGRAM, 0), payload: data }
+    }
+
+    /// Create a JSON datagram.
+    pub fn dgram_json(json: &str) -> Self {
+        Self { header: sf_pack(SF_JSONL, SF_DGRAM, 0), payload: json.as_bytes().to_vec() }
+    }
+
     /// Encode to bytes: [header:u32 LE][len:u32 LE][payload].
     pub fn encode(&self) -> Vec<u8> {
         let len = self.payload.len() as u32;
@@ -432,6 +446,7 @@ impl StreamFrame {
     pub fn is_fin(&self) -> bool { sf_is_fin(self.header) }
     pub fn is_rst(&self) -> bool { sf_is_rst(self.header) }
     pub fn is_syn(&self) -> bool { sf_is_syn(self.header) }
+    pub fn is_dgram(&self) -> bool { sf_is_dgram(self.header) }
     pub fn is_binary(&self) -> bool { sf_is_binary(self.header) }
     pub fn seq(&self) -> u16 { sf_seq(self.header) }
 }
@@ -618,6 +633,31 @@ mod tests {
         assert_eq!(frame.seq(), u16::MAX);
         let frame2 = StreamFrame::binary(0, vec![]);
         assert_eq!(frame2.seq(), 0);
+    }
+
+    #[test]
+    fn stream_frame_dgram() {
+        let dg = StreamFrame::dgram_json(r#"{"status":"processing","task_id":"abc"}"#);
+        assert!(dg.is_dgram());
+        assert!(!dg.is_binary());
+        assert!(!dg.is_fin());
+        assert!(!dg.is_syn());
+        assert_eq!(dg.seq(), 0);
+
+        let encoded = dg.encode();
+        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
+        assert!(decoded.is_dgram());
+        assert_eq!(std::str::from_utf8(&decoded.payload).unwrap(), r#"{"status":"processing","task_id":"abc"}"#);
+    }
+
+    #[test]
+    fn stream_frame_dgram_binary() {
+        let dg = StreamFrame::dgram_binary(vec![0xDE, 0xAD]);
+        assert!(dg.is_dgram());
+        assert!(dg.is_binary());
+        let encoded = dg.encode();
+        let (decoded, _) = StreamFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
     }
 
     #[test]
