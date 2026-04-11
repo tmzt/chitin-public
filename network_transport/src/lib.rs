@@ -604,6 +604,8 @@ pub enum ProcessMsg {
     },
     /// Create a new empty project (git init) in the writeable projects directory.
     CreateProject { name: String },
+    /// Generate a PLAN_N.md using a coder agent, without executing it.
+    PlanTask { project_id: String, prompt: String },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
