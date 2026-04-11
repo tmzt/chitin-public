@@ -6,6 +6,8 @@
 //!
 //! No IO, no async. Pure types + codec.
 
+pub mod heap;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -375,6 +377,43 @@ impl Frame {
         Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_RST, payload: vec![] }
     }
 
+    // ── Reply builders ──
+
+    /// Build a JSONL reply to this frame. Swaps from/to, sets irt from
+    /// the original's from_ep, preserves obo. The reply goes back to
+    /// obo if set, otherwise to from_ep.
+    pub fn reply_jsonl(&self, my_ep: u16, payload: &str) -> Self {
+        let reply_to = if self.obo() != 0 { self.obo() } else { self.from_ep() };
+        Self {
+            mesh_key: mesh_key(my_ep, reply_to),
+            ext: ext_pack(0, self.from_ep() as u16),
+            flags: FMT_JSONL,
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
+
+    /// Build a raw binary reply to this frame.
+    pub fn reply_raw(&self, my_ep: u16, payload: Vec<u8>) -> Self {
+        let reply_to = if self.obo() != 0 { self.obo() } else { self.from_ep() };
+        Self {
+            mesh_key: mesh_key(my_ep, reply_to),
+            ext: ext_pack(0, self.from_ep() as u16),
+            flags: FMT_RAW,
+            payload,
+        }
+    }
+
+    /// Build a forward of this frame to a different target, setting obo
+    /// to the original sender so the response routes back.
+    pub fn forward(&self, my_ep: u16, to_ep: u16) -> Self {
+        Self {
+            mesh_key: mesh_key(my_ep, to_ep),
+            ext: ext_pack(self.from_ep(), ext_irt(self.ext)),
+            flags: self.flags,
+            payload: self.payload.clone(),
+        }
+    }
+
     // ── Accessors ──
 
     pub fn from_ep(&self) -> u16 { mesh_src(self.mesh_key) }
@@ -483,6 +522,40 @@ pub struct NodeEntry {
     pub roles: u64,
     pub status: String,
     pub objects: Vec<NodeObject>,
+}
+
+// ── Per-service message enums ────────────────────────────────────────
+
+/// Messages for SVC_NODE (control plane on stream 0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NodeMsg {
+    NodeList { nodes: Vec<NodeEntry>, entries: Vec<Entry> },
+    NodeAssigned { node_id: u8 },
+    Ping,
+    Pong,
+}
+
+/// Messages for SVC_FAST_THINKER / SVC_DEEP_THINKER.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ThinkerMsg {
+    Infer { prompt: String, max_tokens: u32 },
+    InferResult { text: String, tokens_per_sec: f64 },
+    Error { message: String },
+}
+
+/// Messages for SVC_PROCESS_ENGINE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ProcessMsg {
+    TaskDispatch { task_type: String, project_id: String, prompt: String },
+    SubmitTicket { project_id: String, prompt: String, #[serde(default)] branch: String },
+    ProcessDirective { task_id: String, directive: String },
+    Dump { what: String },
+    StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
+    TaskResult { task_id: String, project: String, agent: String, status: String, output: String },
+    Error { message: String },
 }
 
 // ── Checksum ─────────────────────────────────────────────────────────
