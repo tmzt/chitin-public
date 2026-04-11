@@ -608,6 +608,8 @@ pub enum ProcessMsg {
     PlanTask { project_id: String, prompt: String },
     /// Refine the current plan — read existing PLAN, write new PLAN_name_N.md.
     RefinePlan { project_id: String, prompt: String },
+    /// Execute the current plan — submit a coder ticket referencing PLAN file.
+    ExecutePlan { project_id: String },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
