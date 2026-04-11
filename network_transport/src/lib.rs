@@ -123,36 +123,83 @@ pub const TYPE_NOTE:     u8 = 4;
 pub const TYPE_TERMINAL: u8 = 5;
 // 6-15: reserved
 
-// ── Endpoint display/parse (universal alias) ─────────────────────────
+// ── Resource address (u32) — owner_service:u16 << 16 | resource_id:u16 ──
 
-const EP_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz.~";
+/// Build a resource address from owning service endpoint + resource ID.
+pub const fn resource(owner: u16, id: u16) -> u32 { (owner as u32) << 16 | id as u32 }
+/// Extract the owning service endpoint from a resource address.
+pub const fn res_owner(r: u32) -> u16 { (r >> 16) as u16 }
+/// Extract the resource ID from a resource address.
+pub const fn res_id(r: u32) -> u16 { r as u16 }
+/// Get the node from a resource address (via owner endpoint).
+pub const fn res_node(r: u32) -> u8 { ep_node(res_owner(r)) }
+/// Get the service from a resource address (via owner endpoint).
+pub const fn res_service(r: u32) -> u8 { ep_service(res_owner(r)) }
 
-/// Display an endpoint as a short base58-like string (2-3 chars for u16).
-pub fn ep_display(ep: u16) -> String {
-    let base = EP_ALPHABET.len() as u16;
-    if ep == 0 { return "0".into(); }
-    let mut n = ep;
-    let mut chars = Vec::with_capacity(3);
-    while n > 0 {
-        chars.push(EP_ALPHABET[(n % base) as usize]);
-        n /= base;
-    }
-    chars.reverse();
-    String::from_utf8(chars).unwrap_or_else(|_| format!("{:04x}", ep))
+/// A registry entry — service or resource advertised by a node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Entry {
+    /// Resource address: (service_u16 << 16) | resource_id.
+    /// For services: resource_id = 0 (the service itself).
+    pub addr: u32,
+    /// Human-readable name.
+    pub name: String,
+    /// Optional key-value metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Vec<(String, String)>>,
 }
 
-/// Parse a base58 string back to endpoint u16. Also accepts hex with "0x" prefix.
+impl Entry {
+    /// Create a service entry (resource_id = 0).
+    pub fn service(owner: u16, name: &str) -> Self {
+        Self { addr: resource(owner, 0), name: name.into(), meta: None }
+    }
+
+    /// Create a resource entry.
+    pub fn resource(owner: u16, id: u16, name: &str) -> Self {
+        Self { addr: resource(owner, id), name: name.into(), meta: None }
+    }
+
+    /// Create a resource entry with metadata.
+    pub fn resource_meta(owner: u16, id: u16, name: &str, meta: Vec<(String, String)>) -> Self {
+        Self { addr: resource(owner, id), name: name.into(), meta: Some(meta) }
+    }
+
+    /// The owning service endpoint.
+    pub fn owner(&self) -> u16 { res_owner(self.addr) }
+    /// The resource ID within the service.
+    pub fn id(&self) -> u16 { res_id(self.addr) }
+    /// The node hosting this entry.
+    pub fn node(&self) -> u8 { res_node(self.addr) }
+}
+
+/// Display a resource address as base60 (compact, ~6 chars for u32).
+pub fn res_display(r: u32) -> String { base60_encode(r as u64) }
+
+/// Parse a resource address from base60 or hex (0x prefix).
+pub fn res_parse(s: &str) -> Option<u32> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    base60_decode(s).map(|v| v as u32)
+}
+
+// ── Base60 helpers (delegate to common::util) ────────────────────────
+
+fn base60_encode(n: u64) -> String { common::util::base60_encode_u64(n) }
+fn base60_decode(s: &str) -> Option<u64> { common::util::base60_decode_u64(s) }
+
+// ── Endpoint display/parse ───────────────────────────────────────────
+
+/// Display an endpoint u16 as base60 (2-3 chars).
+pub fn ep_display(ep: u16) -> String { base60_encode(ep as u64) }
+
+/// Parse endpoint from base60 or hex (0x prefix).
 pub fn ep_parse(s: &str) -> Option<u16> {
     if let Some(hex) = s.strip_prefix("0x") {
         return u16::from_str_radix(hex, 16).ok();
     }
-    let base = EP_ALPHABET.len() as u16;
-    let mut result: u16 = 0;
-    for &b in s.as_bytes() {
-        let digit = EP_ALPHABET.iter().position(|&c| c == b)? as u16;
-        result = result.checked_mul(base)?.checked_add(digit)?;
-    }
-    Some(result)
+    base60_decode(s).and_then(|v| if v <= u16::MAX as u64 { Some(v as u16) } else { None })
 }
 
 /// Format an address for human display.
@@ -500,6 +547,41 @@ mod tests {
         assert_eq!(addr_label(endpoint(NODE_CONC, SVC_NODE)), "conc/node");
         assert_eq!(addr_label(endpoint(NODE_RESOLVE, SVC_TERMINAL)), "?/terminal");
         assert_eq!(addr_label(endpoint(5, 20)), "5/svc:20"); // dynamic service
+    }
+
+    #[test]
+    fn resource_address() {
+        let owner = endpoint(5, SVC_REPO_HOST);
+        let r = resource(owner, 1);
+        assert_eq!(res_owner(r), owner);
+        assert_eq!(res_id(r), 1);
+        assert_eq!(res_node(r), 5);
+        assert_eq!(res_service(r), SVC_REPO_HOST);
+    }
+
+    #[test]
+    fn resource_display_parse() {
+        let r = resource(endpoint(5, SVC_REPO_HOST), 42);
+        let s = res_display(r);
+        let parsed = res_parse(&s).unwrap();
+        assert_eq!(parsed, r);
+        // Hex also works
+        assert_eq!(res_parse("0x00010002"), Some(resource(1, 2)));
+    }
+
+    #[test]
+    fn entry_builders() {
+        let owner = endpoint(5, SVC_REPO_HOST);
+        let e = Entry::resource(owner, 1, "htc-kernel-msm7x30");
+        assert_eq!(e.name, "htc-kernel-msm7x30");
+        assert_eq!(e.owner(), owner);
+        assert_eq!(e.id(), 1);
+        assert_eq!(e.node(), 5);
+        assert!(e.meta.is_none());
+
+        let e2 = Entry::service(owner, "repo_host");
+        assert_eq!(e2.id(), 0);
+        assert_eq!(e2.owner(), owner);
     }
 
     #[test]
