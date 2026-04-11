@@ -551,6 +551,8 @@ pub enum ThinkerMsg {
 pub enum ProcessMsg {
     TaskDispatch { task_type: String, project_id: String, prompt: String },
     SubmitTicket { project_id: String, prompt: String, #[serde(default)] branch: String },
+    /// Clone or init a new project in the writeable projects directory.
+    CreateProject { name: String, #[serde(default)] git_url: String },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
