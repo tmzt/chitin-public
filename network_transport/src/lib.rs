@@ -546,12 +546,62 @@ pub enum ThinkerMsg {
     Error { message: String },
 }
 
+/// An inline attachment extracted from fenced blocks in user input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Original fence language tag (e.g. "rust", "json", "md", "")
+    pub fence: String,
+    /// Content body
+    pub content: String,
+}
+
+impl Attachment {
+    pub fn new(fence: &str, content: String) -> Self {
+        Self { fence: fence.to_string(), content }
+    }
+
+    /// Derive MIME type from the fence language tag.
+    pub fn mime(&self) -> &str {
+        match self.fence.as_str() {
+            "" | "md" | "markdown" => "text/markdown",
+            "json" => "application/json",
+            "yaml" | "yml" => "text/yaml",
+            "toml" => "text/toml",
+            "rs" | "rust" => "text/x-rust",
+            "py" | "python" => "text/x-python",
+            "c" | "cpp" | "h" => "text/x-c",
+            "sh" | "bash" | "zsh" => "text/x-shellscript",
+            "js" | "ts" => "text/javascript",
+            "html" => "text/html",
+            "css" => "text/css",
+            "sql" => "text/x-sql",
+            "xml" => "text/xml",
+            "csv" => "text/csv",
+            _ => "text/plain",
+        }
+    }
+
+    /// Whether this attachment is safe to write as a file (only .md for now).
+    pub fn is_writable(&self) -> bool {
+        matches!(self.fence.as_str(), "" | "md" | "markdown")
+    }
+}
+
 /// Messages for SVC_PROCESS_ENGINE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ProcessMsg {
-    TaskDispatch { task_type: String, project_id: String, prompt: String },
-    SubmitTicket { project_id: String, prompt: String, #[serde(default)] branch: String },
+    TaskDispatch {
+        task_type: String, project_id: String, prompt: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
+    SubmitTicket {
+        project_id: String, prompt: String,
+        #[serde(default)] branch: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     /// Create a new empty project (git init) in the writeable projects directory.
     CreateProject { name: String },
     ProcessDirective { task_id: String, directive: String },
