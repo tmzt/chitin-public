@@ -532,6 +532,7 @@ pub struct NodeEntry {
 pub enum NodeMsg {
     NodeList { nodes: Vec<NodeEntry>, entries: Vec<Entry> },
     NodeAssigned { node_id: u8 },
+    ResourceCreated { resource_type: String, name: String, resource_id: String },
     Ping,
     Pong,
 }
@@ -551,8 +552,8 @@ pub enum ThinkerMsg {
 pub enum ProcessMsg {
     TaskDispatch { task_type: String, project_id: String, prompt: String },
     SubmitTicket { project_id: String, prompt: String, #[serde(default)] branch: String },
-    /// Clone or init a new project in the writeable projects directory.
-    CreateProject { name: String, #[serde(default)] git_url: String },
+    /// Create a new empty project (git init) in the writeable projects directory.
+    CreateProject { name: String },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
