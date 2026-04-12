@@ -614,6 +614,10 @@ pub enum ProcessMsg {
     GetScreen { task_id: String, max_lines: u16 },
     /// Screen text response.
     ScreenText { task_id: String, lines: Vec<String> },
+    /// Subscribe to line-by-line output streaming for a task.
+    WatchTask { task_id: String },
+    /// Incremental line output (pushed by RS to subscriber).
+    LineOutput { task_id: String, line_no: u32, text: String },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
