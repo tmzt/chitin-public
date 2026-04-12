@@ -610,6 +610,10 @@ pub enum ProcessMsg {
     RefinePlan { project_id: String, prompt: String },
     /// Execute the current plan — submit a coder ticket referencing PLAN file.
     ExecutePlan { project_id: String },
+    /// Request current screen text for a running process.
+    GetScreen { task_id: String, max_lines: u16 },
+    /// Screen text response.
+    ScreenText { task_id: String, lines: Vec<String> },
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
