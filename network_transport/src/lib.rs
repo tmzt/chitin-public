@@ -195,6 +195,7 @@ fn base60_decode(s: &str) -> Option<u64> { common::util::base60_decode_u64(s) }
 
 /// Display an endpoint u16 as base60 (2-3 chars).
 pub fn ep_display(ep: u16) -> String { base60_encode(ep as u64) }
+pub fn node_display(id: u8) -> String { base60_encode(id as u64) }
 
 /// Parse endpoint from base60 or hex (0x prefix).
 pub fn ep_parse(s: &str) -> Option<u16> {
