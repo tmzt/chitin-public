@@ -610,7 +610,7 @@ pub enum ProcessMsg {
     /// Refine the current plan — read existing PLAN, write new PLAN_name_N.md.
     RefinePlan { project_id: String, prompt: String },
     /// Execute the current plan — submit a coder ticket referencing PLAN file.
-    ExecutePlan { project_id: String },
+    ExecutePlan { project_id: String, #[serde(default)] yolo: bool },
     /// Request current screen text for a running process.
     GetScreen { task_id: String, max_lines: u16 },
     /// Screen text response.
