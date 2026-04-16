@@ -554,6 +554,46 @@ pub enum NodeMsg {
     ResourceCreated { resource_type: String, name: String, resource_id: String },
     Ping,
     Pong,
+    /// Request: which node provides this service?
+    ResolveService { service: u8 },
+    /// Response: node_id that provides the service, with full endpoint.
+    ServiceResolved { service: u8, node_id: u8, endpoint: u16 },
+    /// Service not available on any node.
+    ServiceNotFound { service: u8 },
+}
+
+/// Audio frame fourcc + header for binary PCM data in Frame::raw payloads.
+pub const AUDIO_FOURCC: &[u8; 4] = b"PCMf";
+pub const AUDIO_HEADER_SIZE: usize = 12; // fourcc(4) + sample_rate(4) + num_samples(4)
+
+/// Build a binary audio frame payload: [PCMf][sample_rate:u32 LE][num_samples:u32 LE][f32 samples...]
+pub fn audio_frame_payload(sample_rate: u32, samples: &[f32]) -> Vec<u8> {
+    let num = samples.len() as u32;
+    let mut buf = Vec::with_capacity(AUDIO_HEADER_SIZE + samples.len() * 4);
+    buf.extend_from_slice(AUDIO_FOURCC);
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&num.to_le_bytes());
+    for s in samples {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf
+}
+
+/// Parse a binary audio frame payload. Returns (sample_rate, samples) or None.
+pub fn parse_audio_frame(payload: &[u8]) -> Option<(u32, Vec<f32>)> {
+    if payload.len() < AUDIO_HEADER_SIZE { return None; }
+    if &payload[0..4] != AUDIO_FOURCC { return None; }
+    let sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let num_samples = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+    let data = &payload[AUDIO_HEADER_SIZE..];
+    if data.len() < num_samples * 4 { return None; }
+    let samples: Vec<f32> = (0..num_samples)
+        .map(|i| {
+            let off = i * 4;
+            f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]])
+        })
+        .collect();
+    Some((sample_rate, samples))
 }
 
 /// Messages for SVC_FAST_THINKER / SVC_DEEP_THINKER.
