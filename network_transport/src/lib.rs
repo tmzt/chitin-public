@@ -188,8 +188,26 @@ pub fn res_parse(s: &str) -> Option<u32> {
 
 // ── Base60 helpers (delegate to common::util) ────────────────────────
 
-fn base60_encode(n: u64) -> String { common::util::base60_encode_u64(n) }
-fn base60_decode(s: &str) -> Option<u64> { common::util::base60_decode_u64(s) }
+const BASE60: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz.~";
+
+fn base60_encode(mut n: u64) -> String {
+    let base = BASE60.len() as u64;
+    if n == 0 { return "0".into(); }
+    let mut chars = Vec::with_capacity(11);
+    while n > 0 { chars.push(BASE60[(n % base) as usize]); n /= base; }
+    chars.reverse();
+    String::from_utf8(chars).unwrap_or_else(|_| "?".into())
+}
+
+fn base60_decode(s: &str) -> Option<u64> {
+    let base = BASE60.len() as u64;
+    let mut result: u64 = 0;
+    for &b in s.as_bytes() {
+        let digit = BASE60.iter().position(|&c| c == b)? as u64;
+        result = result.checked_mul(base)?.checked_add(digit)?;
+    }
+    Some(result)
+}
 
 // ── Endpoint display/parse ───────────────────────────────────────────
 
