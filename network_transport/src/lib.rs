@@ -319,17 +319,22 @@ pub struct Frame {
 
 impl Frame {
     /// Encode to wire bytes: [version:u16][checksum:u16][mesh_key:u32][ext:u32][flags:u16][len:u16][payload]
+    /// len field stores payload size in 4-byte words (padded). Max payload = 65535 * 4 = 256KB.
     pub fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len() as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len());
-        // Write header with version=0, checksum=0 for checksum computation
+        let padded_len = (self.payload.len() + 3) / 4;
+        let wire_payload_bytes = padded_len * 4;
+        let len_words = padded_len as u16;
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + wire_payload_bytes);
         buf.extend_from_slice(&0u16.to_le_bytes());     // version (zeroed)
         buf.extend_from_slice(&0u16.to_le_bytes());     // checksum (zeroed)
         buf.extend_from_slice(&self.mesh_key.to_le_bytes());
         buf.extend_from_slice(&self.ext.to_le_bytes());
         buf.extend_from_slice(&self.flags.to_le_bytes());
-        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&len_words.to_le_bytes());
         buf.extend_from_slice(&self.payload);
+        // Pad to 4-byte boundary
+        let pad = wire_payload_bytes - self.payload.len();
+        for _ in 0..pad { buf.push(0); }
 
         let checksum = inet_checksum(&buf);
 
@@ -339,6 +344,7 @@ impl Frame {
     }
 
     /// Decode from wire bytes. Returns (frame, bytes_consumed).
+    /// len field is in 4-byte words. Payload is trimmed of trailing padding.
     pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < FRAME_HEADER_SIZE { return None; }
 
@@ -347,10 +353,11 @@ impl Frame {
         let mesh_key = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let ext = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         let flags = u16::from_le_bytes([data[12], data[13]]);
-        let len = u16::from_le_bytes([data[14], data[15]]) as usize;
+        let len_words = u16::from_le_bytes([data[14], data[15]]) as usize;
+        let wire_bytes = len_words * 4;
 
         if version != PROTOCOL_VERSION { return None; }
-        let total = FRAME_HEADER_SIZE + len;
+        let total = FRAME_HEADER_SIZE + wire_bytes;
         if data.len() < total { return None; }
 
         // Verify checksum
@@ -359,7 +366,10 @@ impl Frame {
         check[2..4].copy_from_slice(&0u16.to_le_bytes());
         if inet_checksum(&check) != stored_csum { return None; }
 
-        let payload = data[FRAME_HEADER_SIZE..total].to_vec();
+        // Trim trailing zero padding (find last non-zero byte)
+        let raw = &data[FRAME_HEADER_SIZE..total];
+        let actual_len = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+        let payload = raw[..actual_len].to_vec();
         Some((Self { mesh_key, ext, flags, payload }, total))
     }
 
