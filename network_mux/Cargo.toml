@@ -1,0 +1,11 @@
+[package]
+name = "network_mux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+network_transport = { path = "../network_transport" }
+yamux = "0.13"
+smol = "2"
+futures-lite = "2"
+log = "0.4"
