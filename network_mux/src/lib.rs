@@ -123,14 +123,47 @@ impl MuxSession {
         Self::from_parts(conn, stream0, on_frame)
     }
 
+    /// Connect with an externally-owned heap.
+    /// Frames pushed to this heap will be written by the session's writer task.
+    pub async fn connect_with_heap(
+        addr: &str,
+        heap: Arc<OutboundHeap>,
+        on_frame: FrameHandler,
+    ) -> Result<Self, String> {
+        let tcp = smol::net::TcpStream::connect(addr).await
+            .map_err(|e| format!("tcp connect {addr}: {e}"))?;
+        tcp.set_nodelay(true).ok();
+        log::info!("[mux] connected to {addr}");
+
+        let cfg = yamux::Config::default();
+        let mut conn = yamux::Connection::new(tcp, cfg, yamux::Mode::Client);
+
+        let stream0 = futures_lite::future::poll_fn(|cx| conn.poll_new_outbound(cx))
+            .await
+            .map_err(|e| format!("yamux stream 0: {e}"))?;
+        log::info!("[mux] stream 0 open");
+
+        Self::from_parts_with_heap(conn, stream0, heap, on_frame)
+    }
+
     /// Build from existing connection + stream 0.
     fn from_parts(
         conn: yamux::Connection<smol::net::TcpStream>,
         stream0: yamux::Stream,
         on_frame: FrameHandler,
     ) -> Result<Self, String> {
-        let (reader, writer) = futures_lite::io::split(stream0);
         let heap = Arc::new(OutboundHeap::new());
+        Self::from_parts_with_heap(conn, stream0, heap, on_frame)
+    }
+
+    /// Build from connection + stream 0 + external heap.
+    fn from_parts_with_heap(
+        conn: yamux::Connection<smol::net::TcpStream>,
+        stream0: yamux::Stream,
+        heap: Arc<OutboundHeap>,
+        on_frame: FrameHandler,
+    ) -> Result<Self, String> {
+        let (reader, writer) = futures_lite::io::split(stream0);
         let state = Arc::new(AtomicU32::new(ConnState::Active as u32));
         let conn = Arc::new(smol::lock::Mutex::new(conn));
 
