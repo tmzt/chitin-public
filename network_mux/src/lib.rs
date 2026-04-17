@@ -221,8 +221,10 @@ impl MuxSession {
                         break;
                     }
                     Ok(n) => {
+                        log::info!("[mux] reader: {} bytes (pending {})", n, pending.len() + n);
                         pending.extend_from_slice(&buf[..n]);
                         while let Some((frame, consumed)) = Frame::decode(&pending) {
+                            log::debug!("[mux] decoded frame: {}B fmt={}", frame.payload.len(), frame.format());
                             on_frame(&frame);
                             pending = pending[consumed..].to_vec();
                         }

@@ -366,10 +366,19 @@ impl Frame {
         check[2..4].copy_from_slice(&0u16.to_le_bytes());
         if inet_checksum(&check) != stored_csum { return None; }
 
-        // Trim trailing zero padding (find last non-zero byte)
+        // Trim trailing zero padding for text formats (JSONL, bincode).
+        // Binary (FMT_RAW) keeps the full padded payload — callers use internal
+        // length fields (e.g., PCMf num_samples) to determine actual size.
         let raw = &data[FRAME_HEADER_SIZE..total];
-        let actual_len = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-        let payload = raw[..actual_len].to_vec();
+        let fmt = (flags >> 13) & 0x7;
+        let payload = if fmt == 2 {
+            // FMT_RAW: keep all bytes (padding is minimal, callers handle length)
+            raw.to_vec()
+        } else {
+            // JSONL/bincode: trim trailing zeros
+            let actual_len = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+            raw[..actual_len].to_vec()
+        };
         Some((Self { mesh_key, ext, flags, payload }, total))
     }
 
