@@ -982,7 +982,7 @@ pub enum SerialCmd {
     FlashESP        = 0x10,
     /// Flash via stub loader (faster: higher baud, compression).
     /// Same payload as FlashESP. Uploads stub to IRAM first, then flashes.
-    FlashESPStub    = 0x11,
+    FlashESPStub    = 0x18,
 }
 
 /// Serial service response tags (serial node → requester).
@@ -1031,7 +1031,7 @@ impl SerialCmd {
             0x08 => Some(Self::WriteRaw),
             0x09 => Some(Self::DeviceInfo),
             0x10 => Some(Self::FlashESP),
-            0x11 => Some(Self::FlashESPStub),
+            0x18 => Some(Self::FlashESPStub),
             _ => None,
         }
     }
