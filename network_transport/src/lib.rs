@@ -973,6 +973,10 @@ pub enum SerialCmd {
     /// Write raw bytes to the serial port.
     /// Payload: [bytes...]
     WriteRaw        = 0x08,
+    /// Get detailed USB device info (lsusb-style).
+    /// Payload: [device_index:u8]
+    /// Response: SerialResp::ScrollbackData with text
+    DeviceInfo      = 0x09,
     /// Flash an ESP32/ESP32-S3 via serial bootloader (esptool raw protocol).
     /// Payload: [chip:u8 (0=ESP32, 1=ESP32-S3)][firmware_len:u32 LE][firmware...]
     FlashESP        = 0x10,
@@ -1022,6 +1026,7 @@ impl SerialCmd {
             0x06 => Some(Self::ReadBytes),
             0x07 => Some(Self::ReadLines),
             0x08 => Some(Self::WriteRaw),
+            0x09 => Some(Self::DeviceInfo),
             0x10 => Some(Self::FlashESP),
             _ => None,
         }
