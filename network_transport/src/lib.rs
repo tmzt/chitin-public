@@ -34,7 +34,8 @@ pub const SVC_TERMINAL:          u8 = 9;
 pub const SVC_ASR:               u8 = 10;
 pub const SVC_DISPLAY:           u8 = 11;
 pub const SVC_FEEDBACK:          u8 = 12;
-// 12-63: dynamic services
+pub const SVC_SERIAL:            u8 = 13;
+// 14-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
 
@@ -50,6 +51,7 @@ pub const ROLE_HEURISTIC_ROUTER:  u64 = 1 << SVC_HEURISTIC_ROUTER;
 pub const ROLE_TERMINAL:          u64 = 1 << SVC_TERMINAL;
 pub const ROLE_ASR:               u64 = 1 << SVC_ASR;
 pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;
+pub const ROLE_SERIAL:            u64 = 1 << SVC_SERIAL;
 
 pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
 pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
@@ -62,7 +64,7 @@ pub fn services_to_str(services: u64) -> String {
         (SVC_REPO_HOST, "repo_host"), (SVC_CODER_HOST, "coder_host"),
         (SVC_VOICE_PROCESSOR, "voice_processor"), (SVC_PROMPT_PROCESSOR, "prompt_processor"),
         (SVC_HEURISTIC_ROUTER, "heuristic_router"), (SVC_TERMINAL, "terminal"),
-        (SVC_ASR, "asr"), (SVC_DISPLAY, "display"),
+        (SVC_ASR, "asr"), (SVC_DISPLAY, "display"), (SVC_SERIAL, "serial"),
     ];
     let mut parts = Vec::new();
     for &(svc, name) in NAMES {
@@ -90,6 +92,7 @@ pub fn services_from_strs(names: &[String]) -> u64 {
             "terminal" => services |= ROLE_TERMINAL,
             "asr" => services |= ROLE_ASR,
             "display" => services |= ROLE_DISPLAY,
+            "serial" => services |= ROLE_SERIAL,
             _ => {}
         }
     }
@@ -253,6 +256,7 @@ pub fn addr_label(a: u16) -> String {
                 SVC_ASR => "asr",
                 SVC_DISPLAY => "display",
                 SVC_FEEDBACK => "feedback",
+                SVC_SERIAL => "serial",
                 _ => return format!("{}/svc:{}", node_str, id),
             };
             return format!("{}/{}", node_str, svc_name);
@@ -930,4 +934,133 @@ mod tests {
         assert!(s.contains("2/9"));
         assert!(s.contains("S")); // SYN flag
     }
+}
+
+// ── SVC_SERIAL protocol ───────────────────────────────────────────────
+//
+// Binary frame format (FMT_RAW):
+//   [0]     SerialCmd tag (u8)
+//   [1..]   Command-specific payload
+//
+// All multi-byte values are little-endian.
+
+/// Serial service command tags (request → serial node).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialCmd {
+    /// List connected USB serial devices.
+    /// Response: SerialResp::DeviceList
+    ListDevices     = 0x01,
+    /// Open a device and start capture (scrollback accumulates on the serial node).
+    /// Payload: [baud:u32 LE][device_index:u8]
+    StartCapture    = 0x02,
+    /// Stop capture and close the device.
+    StopCapture     = 0x03,
+    /// Read scrollback — last N bytes.
+    /// Payload: [len:u32 LE]
+    ReadBytes       = 0x04,
+    /// Read scrollback — last N lines.
+    /// Payload: [count:u32 LE]
+    ReadLines       = 0x05,
+    /// Write raw bytes to the serial port.
+    /// Payload: [bytes...]
+    WriteRaw        = 0x06,
+    /// Flash an ESP32/ESP32-S3 via serial bootloader (esptool raw protocol).
+    /// Payload: [chip:u8 (0=ESP32, 1=ESP32-S3)][firmware_len:u32 LE][firmware...]
+    FlashESP        = 0x10,
+}
+
+/// Serial service response tags (serial node → requester).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialResp {
+    /// Device list: [count:u8][device entries...]
+    /// Each entry: [vid:u16 LE][pid:u16 LE][name_len:u8][name:utf8...]
+    DeviceList      = 0x81,
+    /// Scrollback data: [len:u32 LE][bytes...]
+    ScrollbackData  = 0x82,
+    /// Capture started successfully.
+    CaptureStarted  = 0x83,
+    /// Capture stopped.
+    CaptureStopped  = 0x84,
+    /// Flash progress: [percent:u8][stage_len:u8][stage:utf8...]
+    FlashProgress   = 0x85,
+    /// Flash complete.
+    FlashDone       = 0x86,
+    /// Error: [msg_len:u16 LE][msg:utf8...]
+    Error           = 0xFF,
+}
+
+/// ESP chip variants for FlashESP command.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EspChip {
+    ESP32   = 0,
+    ESP32S3 = 1,
+}
+
+impl SerialCmd {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0x01 => Some(Self::ListDevices),
+            0x02 => Some(Self::StartCapture),
+            0x03 => Some(Self::StopCapture),
+            0x04 => Some(Self::ReadBytes),
+            0x05 => Some(Self::ReadLines),
+            0x06 => Some(Self::WriteRaw),
+            0x10 => Some(Self::FlashESP),
+            _ => None,
+        }
+    }
+}
+
+impl SerialResp {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0x81 => Some(Self::DeviceList),
+            0x82 => Some(Self::ScrollbackData),
+            0x83 => Some(Self::CaptureStarted),
+            0x84 => Some(Self::CaptureStopped),
+            0x85 => Some(Self::FlashProgress),
+            0x86 => Some(Self::FlashDone),
+            0xFF => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+impl EspChip {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::ESP32),
+            1 => Some(Self::ESP32S3),
+            _ => None,
+        }
+    }
+}
+
+/// Build a serial command frame payload.
+pub fn serial_cmd(cmd: SerialCmd, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + data.len());
+    buf.push(cmd as u8);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Build a serial response frame payload.
+pub fn serial_resp(resp: SerialResp, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + data.len());
+    buf.push(resp as u8);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Build a serial error response.
+pub fn serial_error(msg: &str) -> Vec<u8> {
+    let bytes = msg.as_bytes();
+    let mut buf = Vec::with_capacity(3 + bytes.len());
+    buf.push(SerialResp::Error as u8);
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf
 }
