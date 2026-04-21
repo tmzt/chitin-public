@@ -951,20 +951,28 @@ pub enum SerialCmd {
     /// List connected USB serial devices.
     /// Response: SerialResp::DeviceList
     ListDevices     = 0x01,
-    /// Open a device and start capture (scrollback accumulates on the serial node).
+    /// Connect to a device (request USB permission, open, set baud).
     /// Payload: [baud:u32 LE][device_index:u8]
-    StartCapture    = 0x02,
-    /// Stop capture and close the device.
-    StopCapture     = 0x03,
+    /// Response: SerialResp::Connected or Error
+    Connect         = 0x02,
+    /// Disconnect from the current device.
+    /// Response: SerialResp::Disconnected
+    Disconnect      = 0x03,
+    /// Start capture (scrollback accumulates on the serial node).
+    /// Requires a prior Connect.
+    /// Response: SerialResp::CaptureStarted
+    StartCapture    = 0x04,
+    /// Stop capture.
+    StopCapture     = 0x05,
     /// Read scrollback — last N bytes.
     /// Payload: [len:u32 LE]
-    ReadBytes       = 0x04,
+    ReadBytes       = 0x06,
     /// Read scrollback — last N lines.
     /// Payload: [count:u32 LE]
-    ReadLines       = 0x05,
+    ReadLines       = 0x07,
     /// Write raw bytes to the serial port.
     /// Payload: [bytes...]
-    WriteRaw        = 0x06,
+    WriteRaw        = 0x08,
     /// Flash an ESP32/ESP32-S3 via serial bootloader (esptool raw protocol).
     /// Payload: [chip:u8 (0=ESP32, 1=ESP32-S3)][firmware_len:u32 LE][firmware...]
     FlashESP        = 0x10,
@@ -977,16 +985,20 @@ pub enum SerialResp {
     /// Device list: [count:u8][device entries...]
     /// Each entry: [vid:u16 LE][pid:u16 LE][name_len:u8][name:utf8...]
     DeviceList      = 0x81,
-    /// Scrollback data: [len:u32 LE][bytes...]
-    ScrollbackData  = 0x82,
+    /// Device connected and ready.
+    Connected       = 0x82,
+    /// Device disconnected.
+    Disconnected    = 0x83,
     /// Capture started successfully.
-    CaptureStarted  = 0x83,
+    CaptureStarted  = 0x84,
     /// Capture stopped.
-    CaptureStopped  = 0x84,
+    CaptureStopped  = 0x85,
+    /// Scrollback data: [len:u32 LE][bytes...]
+    ScrollbackData  = 0x86,
     /// Flash progress: [percent:u8][stage_len:u8][stage:utf8...]
-    FlashProgress   = 0x85,
+    FlashProgress   = 0x90,
     /// Flash complete.
-    FlashDone       = 0x86,
+    FlashDone       = 0x91,
     /// Error: [msg_len:u16 LE][msg:utf8...]
     Error           = 0xFF,
 }
@@ -1003,11 +1015,13 @@ impl SerialCmd {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x01 => Some(Self::ListDevices),
-            0x02 => Some(Self::StartCapture),
-            0x03 => Some(Self::StopCapture),
-            0x04 => Some(Self::ReadBytes),
-            0x05 => Some(Self::ReadLines),
-            0x06 => Some(Self::WriteRaw),
+            0x02 => Some(Self::Connect),
+            0x03 => Some(Self::Disconnect),
+            0x04 => Some(Self::StartCapture),
+            0x05 => Some(Self::StopCapture),
+            0x06 => Some(Self::ReadBytes),
+            0x07 => Some(Self::ReadLines),
+            0x08 => Some(Self::WriteRaw),
             0x10 => Some(Self::FlashESP),
             _ => None,
         }
@@ -1018,11 +1032,13 @@ impl SerialResp {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x81 => Some(Self::DeviceList),
-            0x82 => Some(Self::ScrollbackData),
-            0x83 => Some(Self::CaptureStarted),
-            0x84 => Some(Self::CaptureStopped),
-            0x85 => Some(Self::FlashProgress),
-            0x86 => Some(Self::FlashDone),
+            0x82 => Some(Self::Connected),
+            0x83 => Some(Self::Disconnected),
+            0x84 => Some(Self::CaptureStarted),
+            0x85 => Some(Self::CaptureStopped),
+            0x86 => Some(Self::ScrollbackData),
+            0x90 => Some(Self::FlashProgress),
+            0x91 => Some(Self::FlashDone),
             0xFF => Some(Self::Error),
             _ => None,
         }
