@@ -33,6 +33,7 @@ pub const SVC_HEURISTIC_ROUTER:  u8 = 8;
 pub const SVC_TERMINAL:          u8 = 9;
 pub const SVC_ASR:               u8 = 10;
 pub const SVC_DISPLAY:           u8 = 11;
+pub const SVC_FEEDBACK:          u8 = 12;
 // 12-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
@@ -251,6 +252,7 @@ pub fn addr_label(a: u16) -> String {
                 SVC_TERMINAL => "terminal",
                 SVC_ASR => "asr",
                 SVC_DISPLAY => "display",
+                SVC_FEEDBACK => "feedback",
                 _ => return format!("{}/svc:{}", node_str, id),
             };
             return format!("{}/{}", node_str, svc_name);
@@ -424,6 +426,19 @@ impl Frame {
         let reply_to = if self.obo() != 0 { self.obo() } else { self.from_ep() };
         Self {
             mesh_key: mesh_key(my_ep, reply_to),
+            ext: ext_pack(0, self.from_ep() as u16),
+            flags: FMT_JSONL,
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
+
+    /// Build a JSONL reply routed to a different service on the requester.
+    /// Use for feedback/status that shouldn't go to the same service handler.
+    pub fn reply_jsonl_svc(&self, from_svc: u8, to_svc: u8, payload: &str) -> Self {
+        let from_node = ep_node(self.to_ep()); // we are the destination of the original
+        let reply_to_node = if self.obo() != 0 { ep_node(self.obo()) } else { self.from_node() };
+        Self {
+            mesh_key: mesh_key(endpoint(from_node, from_svc), endpoint(reply_to_node, to_svc)),
             ext: ext_pack(0, self.from_ep() as u16),
             flags: FMT_JSONL,
             payload: payload.as_bytes().to_vec(),
