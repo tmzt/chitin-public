@@ -977,9 +977,12 @@ pub enum SerialCmd {
     /// Payload: [device_index:u8]
     /// Response: SerialResp::ScrollbackData with text
     DeviceInfo      = 0x09,
-    /// Flash an ESP32/ESP32-S3 via serial bootloader (esptool raw protocol).
+    /// Flash an ESP32/ESP32-S3 via ROM bootloader (esptool raw protocol).
     /// Payload: [chip:u8 (0=ESP32, 1=ESP32-S3)][firmware_len:u32 LE][firmware...]
     FlashESP        = 0x10,
+    /// Flash via stub loader (faster: higher baud, compression).
+    /// Same payload as FlashESP. Uploads stub to IRAM first, then flashes.
+    FlashESPStub    = 0x11,
 }
 
 /// Serial service response tags (serial node → requester).
@@ -1028,6 +1031,7 @@ impl SerialCmd {
             0x08 => Some(Self::WriteRaw),
             0x09 => Some(Self::DeviceInfo),
             0x10 => Some(Self::FlashESP),
+            0x11 => Some(Self::FlashESPStub),
             _ => None,
         }
     }
