@@ -35,7 +35,8 @@ pub const SVC_ASR:               u8 = 10;
 pub const SVC_DISPLAY:           u8 = 11;
 pub const SVC_FEEDBACK:          u8 = 12;
 pub const SVC_SERIAL:            u8 = 13;
-// 14-63: dynamic services
+pub const SVC_DATA:              u8 = 14;
+// 15-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
 
@@ -52,6 +53,7 @@ pub const ROLE_TERMINAL:          u64 = 1 << SVC_TERMINAL;
 pub const ROLE_ASR:               u64 = 1 << SVC_ASR;
 pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;
 pub const ROLE_SERIAL:            u64 = 1 << SVC_SERIAL;
+pub const ROLE_DATA:              u64 = 1 << SVC_DATA;
 
 pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
 pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
@@ -65,6 +67,7 @@ pub fn services_to_str(services: u64) -> String {
         (SVC_VOICE_PROCESSOR, "voice_processor"), (SVC_PROMPT_PROCESSOR, "prompt_processor"),
         (SVC_HEURISTIC_ROUTER, "heuristic_router"), (SVC_TERMINAL, "terminal"),
         (SVC_ASR, "asr"), (SVC_DISPLAY, "display"), (SVC_SERIAL, "serial"),
+        (SVC_DATA, "data"),
     ];
     let mut parts = Vec::new();
     for &(svc, name) in NAMES {
@@ -257,6 +260,7 @@ pub fn addr_label(a: u16) -> String {
                 SVC_DISPLAY => "display",
                 SVC_FEEDBACK => "feedback",
                 SVC_SERIAL => "serial",
+                SVC_DATA => "data",
                 _ => return format!("{}/svc:{}", node_str, id),
             };
             return format!("{}/{}", node_str, svc_name);
