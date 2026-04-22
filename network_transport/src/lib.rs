@@ -729,13 +729,17 @@ pub enum ProcessMsg {
 // ── Checksum ─────────────────────────────────────────────────────────
 
 fn inet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // u64 accumulator so multi-hundred-KB payloads (e.g. a full gmail_search
+    // result) can't overflow the running sum before the carry-fold. A u32
+    // overflows around ~128KB and triggered a debug-mode panic from
+    // SVC_DATA replies.
+    let mut sum: u64 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
-        sum += u16::from_le_bytes([data[i], data[i + 1]]) as u32;
+        sum += u16::from_le_bytes([data[i], data[i + 1]]) as u64;
         i += 2;
     }
-    if i < data.len() { sum += data[i] as u32; }
+    if i < data.len() { sum += data[i] as u64; }
     while sum > 0xFFFF { sum = (sum & 0xFFFF) + (sum >> 16); }
     (!sum & 0xFFFF) as u16
 }
@@ -879,6 +883,20 @@ mod tests {
         let mut encoded = f.encode();
         if let Some(b) = encoded.last_mut() { *b ^= 0xFF; }
         assert!(Frame::decode(&encoded).is_none());
+    }
+
+    #[test]
+    fn frame_large_payload_no_checksum_overflow() {
+        // Regression: inet_checksum's u32 accumulator overflowed on
+        // multi-hundred-KB payloads (e.g. a full gmail_search result),
+        // producing a debug-mode panic "attempt to add with overflow".
+        // The fix uses u64 for the running sum; this must round-trip.
+        // Sized just under the u16-word frame limit (65535 * 4 = 262140B).
+        let body = "x".repeat(200_000);
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), &body);
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).expect("large frame must round-trip");
+        assert_eq!(decoded.payload.len(), body.len());
     }
 
     #[test]
