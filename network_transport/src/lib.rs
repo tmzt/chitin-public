@@ -98,6 +98,7 @@ pub fn services_from_strs(names: &[String]) -> u64 {
             "asr" => services |= ROLE_ASR,
             "display" => services |= ROLE_DISPLAY,
             "serial" => services |= ROLE_SERIAL,
+            "data" => services |= ROLE_DATA,
             "android" => services |= ROLE_ANDROID,
             _ => {}
         }
