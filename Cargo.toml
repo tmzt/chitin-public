@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "network_transport",
+    "network_mux",
+]
+resolver = "2"
