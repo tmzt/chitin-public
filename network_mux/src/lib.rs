@@ -63,6 +63,13 @@ pub enum MuxEvent<'a> {
 /// Frame handler callback — receives frames from stream 0.
 pub type FrameHandler = Arc<dyn Fn(&Frame) + Send + Sync>;
 
+/// Inbound-stream callback — called when a new yamux substream (1+)
+/// arrives. The handler takes ownership of the Stream and is
+/// responsible for its read/write task. The poller continues driving
+/// the yamux Connection in the background so the handler's I/O
+/// progresses without holding the Connection lock.
+pub type StreamHandler = Arc<dyn Fn(yamux::Stream) + Send + Sync>;
+
 /// A self-running yamux session over TCP.
 ///
 /// Owns background tasks for polling the yamux connection, reading frames,
@@ -81,9 +88,13 @@ pub struct MuxSession {
 impl MuxSession {
     /// Connect to a remote address as a yamux client.
     /// Opens stream 0 and starts background tasks.
+    /// `on_stream` is called when a bridged substream arrives from a
+    /// peer (via the concentrator). Pass `None` to ignore inbound
+    /// substreams.
     pub async fn connect(
         addr: &str,
         on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
         let tcp = smol::net::TcpStream::connect(addr).await
             .map_err(|e| format!("tcp connect {addr}: {e}"))?;
@@ -99,14 +110,18 @@ impl MuxSession {
             .map_err(|e| format!("yamux stream 0: {e}"))?;
         log::info!("[mux] stream 0 open");
 
-        Self::from_parts(conn, stream0, on_frame)
+        Self::from_parts(conn, stream0, on_frame, on_stream)
     }
 
     /// Accept a yamux session from an incoming TCP connection (server mode).
     /// Waits for the client to open stream 0.
+    /// `on_stream` is called when the peer opens additional substreams —
+    /// the concentrator uses this to accept Connect control messages
+    /// and bridge to target peers.
     pub async fn accept(
         tcp: smol::net::TcpStream,
         on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
         tcp.set_nodelay(true).ok();
 
@@ -120,7 +135,7 @@ impl MuxSession {
             None => return Err("connection closed before stream 0".into()),
         };
 
-        Self::from_parts(conn, stream0, on_frame)
+        Self::from_parts(conn, stream0, on_frame, on_stream)
     }
 
     /// Connect with an externally-owned heap.
@@ -129,6 +144,7 @@ impl MuxSession {
         addr: &str,
         heap: Arc<OutboundHeap>,
         on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
         let tcp = smol::net::TcpStream::connect(addr).await
             .map_err(|e| format!("tcp connect {addr}: {e}"))?;
@@ -143,7 +159,7 @@ impl MuxSession {
             .map_err(|e| format!("yamux stream 0: {e}"))?;
         log::info!("[mux] stream 0 open");
 
-        Self::from_parts_with_heap(conn, stream0, heap, on_frame)
+        Self::from_parts_with_heap(conn, stream0, heap, on_frame, on_stream)
     }
 
     /// Build from existing connection + stream 0.
@@ -151,9 +167,10 @@ impl MuxSession {
         conn: yamux::Connection<smol::net::TcpStream>,
         stream0: yamux::Stream,
         on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
         let heap = Arc::new(OutboundHeap::new());
-        Self::from_parts_with_heap(conn, stream0, heap, on_frame)
+        Self::from_parts_with_heap(conn, stream0, heap, on_frame, on_stream)
     }
 
     /// Build from connection + stream 0 + external heap.
@@ -162,6 +179,7 @@ impl MuxSession {
         stream0: yamux::Stream,
         heap: Arc<OutboundHeap>,
         on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
         let (reader, writer) = futures_lite::io::split(stream0);
         let state = Arc::new(AtomicU32::new(ConnState::Active as u32));
@@ -170,17 +188,19 @@ impl MuxSession {
         // ── Poller task: drive yamux connection ──
         let poller_conn = conn.clone();
         let poller_state = state.clone();
+        let poller_on_stream = on_stream.clone();
         let poller = smol::spawn(async move {
             loop {
                 if !ConnState::from_u32(poller_state.load(Ordering::Relaxed)).is_alive() {
                     break;
                 }
-                let closed = {
+                let (closed, new_stream) = {
                     let mut c = poller_conn.lock().await;
-                    futures_lite::future::poll_fn(|cx| {
+                    let mut new_stream: Option<yamux::Stream> = None;
+                    let closed = futures_lite::future::poll_fn(|cx| {
                         match c.poll_next_inbound(cx) {
-                            std::task::Poll::Ready(Some(Ok(_))) => {
-                                log::debug!("[mux] unexpected inbound stream");
+                            std::task::Poll::Ready(Some(Ok(s))) => {
+                                new_stream = Some(s);
                             }
                             std::task::Poll::Ready(Some(Err(e))) => {
                                 log::warn!("[mux] yamux error: {e}");
@@ -193,8 +213,18 @@ impl MuxSession {
                             std::task::Poll::Pending => {}
                         }
                         std::task::Poll::Ready(false)
-                    }).await
+                    }).await;
+                    (closed, new_stream)
                 };
+                // Hand inbound substream to the caller's handler (if any)
+                // outside the Connection lock so the handler's I/O can
+                // progress without deadlocking the poller.
+                if let Some(stream) = new_stream {
+                    match poller_on_stream.as_ref() {
+                        Some(handler) => handler(stream),
+                        None => log::debug!("[mux] inbound stream dropped (no on_stream handler)"),
+                    }
+                }
                 if closed {
                     poller_state.store(ConnState::Dead as u32, Ordering::Relaxed);
                     break;
