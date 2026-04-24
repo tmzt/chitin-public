@@ -1,11 +1,14 @@
 //! Shared yamux multiplexer for chitin network connections.
 //!
-//! Provides `MuxSession` — a self-running yamux session with background
-//! poller, reader, and writer tasks. Used by both the concentrator (server)
-//! and node clients.
+//! Provides `MuxSession<T>` — a self-running yamux session with background
+//! poller, reader, and writer tasks. Generic over any `AsyncRead+AsyncWrite`
+//! transport, with TCP-specific `connect` / `connect_with_heap` / `accept_tcp`
+//! convenience methods for the common case. Used by both the concentrator
+//! (server) and node clients; the generic form also supports wrapping
+//! authenticated streams (e.g. libp2p-Noise) in front of yamux.
 //!
 //! ```text
-//! MuxSession
+//! MuxSession<T>
 //!   ├── poller_task: drives yamux Connection (poll_next_inbound)
 //!   ├── reader_task: reads frames from stream 0 → on_frame callback
 //!   └── writer_task: drains OutboundHeap → writes to stream 0
@@ -14,7 +17,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use network_transport::heap::{OutboundHeap, Priority};
 use network_transport::Frame;
 
@@ -70,22 +73,41 @@ pub type FrameHandler = Arc<dyn Fn(&Frame) + Send + Sync>;
 /// progresses without holding the Connection lock.
 pub type StreamHandler = Arc<dyn Fn(yamux::Stream) + Send + Sync>;
 
-/// A self-running yamux session over TCP.
+/// Trait bound bundle for the underlying transport type. Any type satisfying
+/// this can back a `MuxSession` — raw TCP, noise-wrapped streams, in-memory
+/// pipes for tests, etc.
+pub trait MuxTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxTransport for T {}
+
+/// A self-running yamux session over any `AsyncRead+AsyncWrite` transport.
 ///
 /// Owns background tasks for polling the yamux connection, reading frames,
 /// and writing frames. Callers push frames via `send()` and receive them
 /// through the `on_frame` callback provided at construction.
-pub struct MuxSession {
+///
+/// For TCP use, prefer `MuxSession::connect(addr, ...)` or
+/// `MuxSession::accept_tcp(tcp, ...)` which set `TCP_NODELAY`. For
+/// pre-wrapped transports (e.g. libp2p-noise), call the generic
+/// `MuxSession::accept(transport, ...)` directly.
+pub struct MuxSession<T: MuxTransport> {
     heap: Arc<OutboundHeap>,
     state: SharedState,
-    conn: Arc<smol::lock::Mutex<yamux::Connection<smol::net::TcpStream>>>,
+    conn: Arc<smol::lock::Mutex<yamux::Connection<T>>>,
     // Keep task handles to cancel on drop
     _poller: smol::Task<()>,
     _reader: smol::Task<()>,
     _writer: smol::Task<()>,
 }
 
-impl MuxSession {
+// ── TCP-specific convenience constructors ──
+//
+// `connect` needs a concrete transport type because it materializes a
+// TcpStream from an address string; there's no generic analogue. Likewise
+// `accept_tcp` preserves the pre-refactor TCP_NODELAY behavior for callers
+// passing raw TcpStreams. New callers can put a Noise / TLS wrapper around
+// a TcpStream and hand it to the generic `accept`.
+
+impl MuxSession<smol::net::TcpStream> {
     /// Connect to a remote address as a yamux client.
     /// Opens stream 0 and starts background tasks.
     /// `on_stream` is called when a bridged substream arrives from a
@@ -96,7 +118,8 @@ impl MuxSession {
         on_frame: FrameHandler,
         on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
-        let tcp = smol::net::TcpStream::connect(addr).await
+        let tcp = smol::net::TcpStream::connect(addr)
+            .await
             .map_err(|e| format!("tcp connect {addr}: {e}"))?;
         tcp.set_nodelay(true).ok();
         log::info!("[mux] connected to {addr}");
@@ -113,31 +136,6 @@ impl MuxSession {
         Self::from_parts(conn, stream0, on_frame, on_stream)
     }
 
-    /// Accept a yamux session from an incoming TCP connection (server mode).
-    /// Waits for the client to open stream 0.
-    /// `on_stream` is called when the peer opens additional substreams —
-    /// the concentrator uses this to accept Connect control messages
-    /// and bridge to target peers.
-    pub async fn accept(
-        tcp: smol::net::TcpStream,
-        on_frame: FrameHandler,
-        on_stream: Option<StreamHandler>,
-    ) -> Result<Self, String> {
-        tcp.set_nodelay(true).ok();
-
-        let cfg = yamux::Config::default();
-        let mut conn = yamux::Connection::new(tcp, cfg, yamux::Mode::Server);
-
-        // Wait for client to open stream 0
-        let stream0 = match futures_lite::future::poll_fn(|cx| conn.poll_next_inbound(cx)).await {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => return Err(format!("accept stream 0: {e}")),
-            None => return Err("connection closed before stream 0".into()),
-        };
-
-        Self::from_parts(conn, stream0, on_frame, on_stream)
-    }
-
     /// Connect with an externally-owned heap.
     /// Frames pushed to this heap will be written by the session's writer task.
     pub async fn connect_with_heap(
@@ -146,7 +144,8 @@ impl MuxSession {
         on_frame: FrameHandler,
         on_stream: Option<StreamHandler>,
     ) -> Result<Self, String> {
-        let tcp = smol::net::TcpStream::connect(addr).await
+        let tcp = smol::net::TcpStream::connect(addr)
+            .await
             .map_err(|e| format!("tcp connect {addr}: {e}"))?;
         tcp.set_nodelay(true).ok();
         log::info!("[mux] connected to {addr}");
@@ -162,9 +161,52 @@ impl MuxSession {
         Self::from_parts_with_heap(conn, stream0, heap, on_frame, on_stream)
     }
 
+    /// Accept a yamux session from an incoming TCP connection. Sets
+    /// `TCP_NODELAY` before handing off to the generic `accept`. Pre-refactor
+    /// callers that called `MuxSession::accept(tcp, ...)` should migrate to
+    /// `MuxSession::accept_tcp(tcp, ...)` to preserve nodelay behavior.
+    pub async fn accept_tcp(
+        tcp: smol::net::TcpStream,
+        on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
+    ) -> Result<Self, String> {
+        tcp.set_nodelay(true).ok();
+        Self::accept(tcp, on_frame, on_stream).await
+    }
+}
+
+// ── Generic constructors (work on any transport) ──
+
+impl<T: MuxTransport> MuxSession<T> {
+    /// Accept a yamux session from an incoming transport (server mode).
+    /// Waits for the client to open stream 0.
+    /// `on_stream` is called when the peer opens additional substreams —
+    /// the concentrator uses this to accept Connect control messages
+    /// and bridge to target peers.
+    ///
+    /// This is generic over any `AsyncRead+AsyncWrite` transport. For raw
+    /// TCP with `TCP_NODELAY`, use `MuxSession::<TcpStream>::accept_tcp`.
+    pub async fn accept(
+        transport: T,
+        on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
+    ) -> Result<Self, String> {
+        let cfg = yamux::Config::default();
+        let mut conn = yamux::Connection::new(transport, cfg, yamux::Mode::Server);
+
+        // Wait for client to open stream 0
+        let stream0 = match futures_lite::future::poll_fn(|cx| conn.poll_next_inbound(cx)).await {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Err(format!("accept stream 0: {e}")),
+            None => return Err("connection closed before stream 0".into()),
+        };
+
+        Self::from_parts(conn, stream0, on_frame, on_stream)
+    }
+
     /// Build from existing connection + stream 0.
     fn from_parts(
-        conn: yamux::Connection<smol::net::TcpStream>,
+        conn: yamux::Connection<T>,
         stream0: yamux::Stream,
         on_frame: FrameHandler,
         on_stream: Option<StreamHandler>,
@@ -175,7 +217,7 @@ impl MuxSession {
 
     /// Build from connection + stream 0 + external heap.
     fn from_parts_with_heap(
-        conn: yamux::Connection<smol::net::TcpStream>,
+        conn: yamux::Connection<T>,
         stream0: yamux::Stream,
         heap: Arc<OutboundHeap>,
         on_frame: FrameHandler,
@@ -213,7 +255,8 @@ impl MuxSession {
                             std::task::Poll::Pending => {}
                         }
                         std::task::Poll::Ready(false)
-                    }).await;
+                    })
+                    .await;
                     (closed, new_stream)
                 };
                 // Hand inbound substream to the caller's handler (if any)
@@ -348,7 +391,7 @@ impl MuxSession {
     }
 }
 
-impl Drop for MuxSession {
+impl<T: MuxTransport> Drop for MuxSession<T> {
     fn drop(&mut self) {
         self.state.store(ConnState::Shutdown as u32, Ordering::Relaxed);
     }
@@ -357,7 +400,7 @@ impl Drop for MuxSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use network_transport::{endpoint, mesh_key, NODE_CONC, SVC_NODE};
+    use network_transport::{endpoint, NODE_CONC, SVC_NODE};
 
     #[test]
     fn conn_state_roundtrip() {
