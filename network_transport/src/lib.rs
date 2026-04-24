@@ -733,7 +733,20 @@ pub enum ProcessMsg {
     ProcessDirective { task_id: String, directive: String },
     Dump { what: String },
     StreamOpen { task_id: String, stream_id: u32, rows: u16, cols: u16 },
-    TaskResult { task_id: String, project: String, agent: String, status: String, output: String },
+    TaskResult {
+        task_id: String,
+        project: String,
+        agent: String,
+        status: String,
+        output: String,
+        /// Echoed back from the triggering `TaskDispatch.interactive`.
+        /// Lets clients decide whether to auto-open the terminal
+        /// viewer on the ACK even when they didn't originate the
+        /// dispatch (another tablet observing the mesh, a restored
+        /// session). Serde default keeps older senders compatible.
+        #[serde(default)]
+        interactive: bool,
+    },
     Error { message: String },
 }
 
