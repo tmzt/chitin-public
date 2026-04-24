@@ -701,6 +701,12 @@ pub enum ProcessMsg {
         task_type: String, project_id: String, prompt: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
+        /// When true, the caller wants the terminal opened immediately
+        /// (e.g. /shell). When false (default), the task runs headless
+        /// and the user opens the viewer on demand by tapping the task
+        /// row (/code, /plan, /refine, /execute).
+        #[serde(default)]
+        interactive: bool,
     },
     SubmitTicket {
         project_id: String, prompt: String,
