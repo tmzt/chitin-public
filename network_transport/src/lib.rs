@@ -37,7 +37,8 @@ pub const SVC_FEEDBACK:          u8 = 12;
 pub const SVC_SERIAL:            u8 = 13;
 pub const SVC_DATA:              u8 = 14;
 pub const SVC_ANDROID:           u8 = 15;
-// 16-63: dynamic services
+pub const SVC_SKILLS:            u8 = 16;
+// 17-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
 
@@ -56,6 +57,7 @@ pub const ROLE_DISPLAY:           u64 = 1 << SVC_DISPLAY;
 pub const ROLE_SERIAL:            u64 = 1 << SVC_SERIAL;
 pub const ROLE_DATA:              u64 = 1 << SVC_DATA;
 pub const ROLE_ANDROID:          u64 = 1 << SVC_ANDROID;
+pub const ROLE_SKILLS:            u64 = 1 << SVC_SKILLS;
 
 pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
 pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
@@ -70,6 +72,7 @@ pub fn services_to_str(services: u64) -> String {
         (SVC_HEURISTIC_ROUTER, "heuristic_router"), (SVC_TERMINAL, "terminal"),
         (SVC_ASR, "asr"), (SVC_DISPLAY, "display"), (SVC_SERIAL, "serial"),
         (SVC_DATA, "data"), (SVC_ANDROID, "android"),
+        (SVC_SKILLS, "skills"),
     ];
     let mut parts = Vec::new();
     for &(svc, name) in NAMES {
@@ -100,6 +103,7 @@ pub fn services_from_strs(names: &[String]) -> u64 {
             "serial" => services |= ROLE_SERIAL,
             "data" => services |= ROLE_DATA,
             "android" => services |= ROLE_ANDROID,
+            "skills" => services |= ROLE_SKILLS,
             _ => {}
         }
     }
@@ -748,6 +752,50 @@ pub enum ProcessMsg {
         interactive: bool,
     },
     Error { message: String },
+}
+
+/// Messages for `SVC_SKILLS`. Resource-server advertises this service
+/// and serves the skill catalog from its `~/.chitin/skills` directory;
+/// clients discover + dispatch skills over the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SkillMsg {
+    /// Enumerate all skills on the responding rs node. The reply is
+    /// a `SkillListReply` carrying a `Vec<SkillMetaWire>`.
+    List,
+    SkillListReply { skills: Vec<SkillMetaWire> },
+    /// Dispatch a skill by name with string params.
+    Dispatch {
+        skill_name: String,
+        #[serde(default)]
+        params: Vec<(String, String)>,
+    },
+    /// Initial ack + terminal result share the same shape as
+    /// `ProcessMsg::TaskResult` (status: "running" / "complete" / "error").
+    TaskResult {
+        task_id: String,
+        skill_name: String,
+        status: String,
+        output: String,
+    },
+    /// Best-effort cancel by task_id.
+    Cancel { task_id: String },
+    Error { message: String },
+}
+
+/// Wire-shape of skill metadata. Kept separate from the domain
+/// `common::protocol::SkillMeta` so the transport crate stays dep-free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMetaWire {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub param_names: Vec<String>,
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub cron_interval_ms: u64,
 }
 
 // ── Checksum ─────────────────────────────────────────────────────────
