@@ -10,7 +10,7 @@ pub mod heap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const FRAME_HEADER_SIZE: usize = 16;
 
 // ── Node IDs (6 bits) ────────────────────────────────────────────────
@@ -298,6 +298,12 @@ pub const FLAG_RST: u16 = 1 << 11;
 pub const FLAG_ACK: u16 = 1 << 10;
 pub const FLAG_SYN: u16 = 1 << 9;
 
+// TLV header extension (bit 7). When set, the bytes immediately after the
+// 16-byte fixed header are a TLV section, followed by the normal payload.
+// `frame.len` (in u32 words) covers TLV section + payload, so relays can
+// copy frames byte-for-byte without parsing TLV.
+pub const FMT_HAS_TLV: u16 = 1 << 7;
+
 // TTL (bits 8-5, log-scaled, only meaningful with SYN)
 pub const TTL_SHIFT: u16 = 5;
 pub const TTL_MASK:  u16 = 0xF << 5;
@@ -326,6 +332,134 @@ pub const fn ext_pack(obo: u16, in_reply_to: u16) -> u32 {
 pub const fn ext_obo(ext: u32) -> u16 { (ext >> 16) as u16 }
 pub const fn ext_irt(ext: u32) -> u16 { ext as u16 }
 
+// ── TLV header extension ─────────────────────────────────────────────
+//
+// When `FMT_HAS_TLV` is set on a frame's flags, the bytes immediately after
+// the 16-byte fixed header form a TLV (type-length-value) section, then the
+// payload follows. `frame.len` (u32 words) covers BOTH the TLV bytes and
+// the payload bytes — the routing-critical invariant: relays copy `len`
+// words verbatim without ever parsing TLV.
+//
+// Section header (1 × u32):
+//   [section_len: u8]      total section bytes ÷ 4 (header + tags + pad)
+//   [reserved:    u8]      = 0
+//   [reserved:    u16]     = 0
+//
+// Each tag starts with a 16-bit LE header:
+//   bits 15..14 = tag_type (2 bits)
+//   bits 13..0  = tag_id   (14 bits, 16 384 ids; tag_id == 0 = end-of-section)
+//
+// Tag types:
+//   0  U16 INLINE   data is u16 LE, total tag = 4 bytes (1 × u32)
+//   1  U32 INLINE   data is u32 LE, total tag = 6 bytes
+//   2  VAR LENGTH   [tag_len: u8][data: tag_len bytes], tag_len ≤ 251
+//   3  RESERVED     for future encodings (u64 inline, etc.)
+//
+// Tags pack back-to-back (no per-tag u32 padding). After the last real tag
+// the encoder writes 0..=3 zero bytes to round the section to its u32
+// boundary; the first such zero byte forms a `tag_hdr == 0x0000` (type=0,
+// tag_id=0), which the walker treats as end-of-section.
+
+/// Mask for the 14-bit tag_id portion of a TLV tag header.
+pub const TLV_TAG_ID_MASK: u16 = 0x3FFF;
+/// Shift to extract the 2-bit tag type.
+pub const TLV_TAG_TYPE_SHIFT: u16 = 14;
+
+pub const TLV_TYPE_U16: u16 = 0;
+pub const TLV_TYPE_U32: u16 = 1;
+pub const TLV_TYPE_VAR: u16 = 2;
+// 3 is reserved.
+
+/// Routing-metadata tags defined by this crate. Numeric values are the
+/// on-wire 14-bit `tag_id`. `tag_id == 0` is reserved as end-of-section
+/// and never assigned to a variant.
+///
+/// Reserved ranges:
+///   0x0001..=0x00FF  routing metadata (this crate)
+///   0x0100..=0x2FFF  available for app-defined tags (in their own enum)
+///   0x3000..=0x3FFF  reserved for vendor extensions
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FrameTlvTag {
+    /// VAR utf-8, ≤255 bytes — surface id (e.g. card_key).
+    Source = 0x0001,
+    /// U16 — explicit reply endpoint override.
+    ReplyTarget = 0x0002,
+    /// U32 — correlate replies to a task.
+    TaskId = 0x0003,
+}
+
+impl FrameTlvTag {
+    pub fn as_u14(self) -> u16 {
+        self as u16
+    }
+    pub fn try_from_u14(raw: u16) -> Option<Self> {
+        match raw {
+            0x0001 => Some(Self::Source),
+            0x0002 => Some(Self::ReplyTarget),
+            0x0003 => Some(Self::TaskId),
+            _ => None,
+        }
+    }
+}
+
+/// Encoder-side input. The variant picks the on-wire tag type.
+#[derive(Debug, Clone)]
+pub enum FrameTlvValue<'a> {
+    U16(u16),
+    U32(u32),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> FrameTlvValue<'a> {
+    fn tag_type(&self) -> u16 {
+        match self {
+            Self::U16(_) => TLV_TYPE_U16,
+            Self::U32(_) => TLV_TYPE_U32,
+            Self::Bytes(_) => TLV_TYPE_VAR,
+        }
+    }
+}
+
+/// Encode a TLV section from `tags` into `out`. Returns the number of bytes
+/// written, including the 4-byte section header and trailing zero-pad to
+/// a u32 boundary. Each VAR tag's data must fit in u8 (≤255).
+fn encode_tlv_section(out: &mut Vec<u8>, tags: &[(u16, FrameTlvValue<'_>)]) -> usize {
+    let start = out.len();
+    // Section header — 4 bytes; section_len patched after we know the size.
+    out.extend_from_slice(&[0u8; 4]);
+
+    for &(tag_id_u14, ref value) in tags {
+        debug_assert!(tag_id_u14 != 0, "tag_id 0 is reserved");
+        debug_assert!(tag_id_u14 & !TLV_TAG_ID_MASK == 0, "tag_id exceeds 14 bits");
+        let hdr = ((value.tag_type() & 0b11) << TLV_TAG_TYPE_SHIFT)
+            | (tag_id_u14 & TLV_TAG_ID_MASK);
+        out.extend_from_slice(&hdr.to_le_bytes());
+        match value {
+            FrameTlvValue::U16(v) => out.extend_from_slice(&v.to_le_bytes()),
+            FrameTlvValue::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            FrameTlvValue::Bytes(b) => {
+                debug_assert!(b.len() <= u8::MAX as usize, "VAR tag data > 255");
+                out.push(b.len() as u8);
+                out.extend_from_slice(b);
+            }
+        }
+    }
+
+    // Pad to u32 boundary. The pad bytes are zero; the first zero forms a
+    // tag_hdr == 0 which the walker reads as end-of-section.
+    while (out.len() - start) % 4 != 0 {
+        out.push(0);
+    }
+
+    let section_bytes = out.len() - start;
+    debug_assert!(section_bytes % 4 == 0);
+    let words = section_bytes / 4;
+    debug_assert!(words <= u8::MAX as usize, "TLV section > 1020 bytes");
+    out[start] = words as u8;
+    section_bytes
+}
+
 // ── Frame ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -333,26 +467,38 @@ pub struct Frame {
     pub mesh_key: u32,
     pub ext: u32,
     pub flags: u16,
+    /// TLV section bytes (without the leading section-len header? — no,
+    /// includes it). Empty when `FMT_HAS_TLV` is unset. Always u32-aligned
+    /// when present. Set via `Frame::with_tlv` / `Frame::with_source`.
+    pub tlv: Vec<u8>,
     pub payload: Vec<u8>,
 }
 
 impl Frame {
-    /// Encode to wire bytes: [version:u16][checksum:u16][mesh_key:u32][ext:u32][flags:u16][len:u16][payload]
-    /// len field stores payload size in 4-byte words (padded). Max payload = 65535 * 4 = 256KB.
+    /// Encode to wire bytes: [version:u16][checksum:u16][mesh_key:u32][ext:u32][flags:u16][len:u16][tlv?][payload]
+    /// len field stores TLV+payload size in 4-byte words. When `FMT_HAS_TLV`
+    /// is set, the TLV section bytes precede the payload; both are covered
+    /// by `len`, so relays can copy verbatim. Max len = 65535 * 4 = 256KB.
     pub fn encode(&self) -> Vec<u8> {
-        let padded_len = (self.payload.len() + 3) / 4;
-        let wire_payload_bytes = padded_len * 4;
-        let len_words = padded_len as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + wire_payload_bytes);
+        let has_tlv = self.flags & FMT_HAS_TLV != 0;
+        let tlv_bytes = if has_tlv { self.tlv.len() } else { 0 };
+        debug_assert!(tlv_bytes % 4 == 0, "TLV section must be u32-aligned");
+        let padded_payload = (self.payload.len() + 3) / 4 * 4;
+        let wire_bytes = tlv_bytes + padded_payload;
+        let len_words = (wire_bytes / 4) as u16;
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + wire_bytes);
         buf.extend_from_slice(&0u16.to_le_bytes());     // version (zeroed)
         buf.extend_from_slice(&0u16.to_le_bytes());     // checksum (zeroed)
         buf.extend_from_slice(&self.mesh_key.to_le_bytes());
         buf.extend_from_slice(&self.ext.to_le_bytes());
         buf.extend_from_slice(&self.flags.to_le_bytes());
         buf.extend_from_slice(&len_words.to_le_bytes());
+        if has_tlv {
+            buf.extend_from_slice(&self.tlv);
+        }
         buf.extend_from_slice(&self.payload);
-        // Pad to 4-byte boundary
-        let pad = wire_payload_bytes - self.payload.len();
+        // Pad payload to 4-byte boundary (TLV is already aligned).
+        let pad = padded_payload - self.payload.len();
         for _ in 0..pad { buf.push(0); }
 
         let checksum = inet_checksum(&buf);
@@ -363,7 +509,9 @@ impl Frame {
     }
 
     /// Decode from wire bytes. Returns (frame, bytes_consumed).
-    /// len field is in 4-byte words. Payload is trimmed of trailing padding.
+    /// len field is in 4-byte words. When `FMT_HAS_TLV` is set, the TLV
+    /// section is split off into `frame.tlv` and the remaining bytes form
+    /// the payload (trimmed of trailing zero padding for text formats).
     pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < FRAME_HEADER_SIZE { return None; }
 
@@ -385,53 +533,64 @@ impl Frame {
         check[2..4].copy_from_slice(&0u16.to_le_bytes());
         if inet_checksum(&check) != stored_csum { return None; }
 
+        let body = &data[FRAME_HEADER_SIZE..total];
+
+        // Split off the TLV section first so it isn't trimmed/treated as
+        // payload by the format-specific tail handling below.
+        let (tlv, raw): (Vec<u8>, &[u8]) = if flags & FMT_HAS_TLV != 0 {
+            if body.len() < 4 { return None; }
+            let words = body[0] as usize;
+            let section_bytes = words * 4;
+            if section_bytes < 4 || section_bytes > body.len() { return None; }
+            (body[..section_bytes].to_vec(), &body[section_bytes..])
+        } else {
+            (Vec::new(), body)
+        };
+
         // Trim trailing zero padding for text formats (JSONL, bincode).
         // Binary (FMT_RAW) keeps the full padded payload — callers use internal
         // length fields (e.g., PCMf num_samples) to determine actual size.
-        let raw = &data[FRAME_HEADER_SIZE..total];
         let fmt = (flags >> 13) & 0x7;
         let payload = if fmt == 2 {
-            // FMT_RAW: keep all bytes (padding is minimal, callers handle length)
             raw.to_vec()
         } else {
-            // JSONL/bincode: trim trailing zeros
             let actual_len = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
             raw[..actual_len].to_vec()
         };
-        Some((Self { mesh_key, ext, flags, payload }, total))
+        Some((Self { mesh_key, ext, flags, tlv, payload }, total))
     }
 
     // ── Builders ──
 
     /// JSONL fire-and-forget (no SYN/FIN).
     pub fn jsonl(from: u16, to: u16, payload: &str) -> Self {
-        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_JSONL, payload: payload.as_bytes().to_vec() }
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_JSONL, tlv: Vec::new(), payload: payload.as_bytes().to_vec() }
     }
 
     /// JSONL with in_reply_to.
     pub fn jsonl_reply(from: u16, to: u16, irt: u16, payload: &str) -> Self {
-        Self { mesh_key: mesh_key(from, to), ext: ext_pack(0, irt), flags: FMT_JSONL, payload: payload.as_bytes().to_vec() }
+        Self { mesh_key: mesh_key(from, to), ext: ext_pack(0, irt), flags: FMT_JSONL, tlv: Vec::new(), payload: payload.as_bytes().to_vec() }
     }
 
     /// Raw binary fire-and-forget.
     pub fn raw(from: u16, to: u16, payload: Vec<u8>) -> Self {
-        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_RAW, payload }
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FMT_RAW, tlv: Vec::new(), payload }
     }
 
     /// SYN (stream open) with TTL.
     pub fn syn(from: u16, to: u16, ttl: u8, payload: Vec<u8>) -> Self {
         let flags = FMT_RAW | FLAG_SYN | ((ttl as u16 & 0xF) << TTL_SHIFT);
-        Self { mesh_key: mesh_key(from, to), ext: 0, flags, payload }
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags, tlv: Vec::new(), payload }
     }
 
     /// FIN (stream close).
     pub fn fin(from: u16, to: u16) -> Self {
-        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_FIN, payload: vec![] }
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_FIN, tlv: Vec::new(), payload: vec![] }
     }
 
     /// RST (abort).
     pub fn rst(from: u16, to: u16) -> Self {
-        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_RST, payload: vec![] }
+        Self { mesh_key: mesh_key(from, to), ext: 0, flags: FLAG_RST, tlv: Vec::new(), payload: vec![] }
     }
 
     // ── Reply builders ──
@@ -445,6 +604,7 @@ impl Frame {
             mesh_key: mesh_key(my_ep, reply_to),
             ext: ext_pack(0, self.from_ep() as u16),
             flags: FMT_JSONL,
+            tlv: Vec::new(),
             payload: payload.as_bytes().to_vec(),
         }
     }
@@ -458,6 +618,7 @@ impl Frame {
             mesh_key: mesh_key(endpoint(from_node, from_svc), endpoint(reply_to_node, to_svc)),
             ext: ext_pack(0, self.from_ep() as u16),
             flags: FMT_JSONL,
+            tlv: Vec::new(),
             payload: payload.as_bytes().to_vec(),
         }
     }
@@ -469,17 +630,20 @@ impl Frame {
             mesh_key: mesh_key(my_ep, reply_to),
             ext: ext_pack(0, self.from_ep() as u16),
             flags: FMT_RAW,
+            tlv: Vec::new(),
             payload,
         }
     }
 
     /// Build a forward of this frame to a different target, setting obo
-    /// to the original sender so the response routes back.
+    /// to the original sender so the response routes back. Forwards the
+    /// TLV section verbatim (relays don't introspect / mutate it).
     pub fn forward(&self, my_ep: u16, to_ep: u16) -> Self {
         Self {
             mesh_key: mesh_key(my_ep, to_ep),
             ext: ext_pack(self.from_ep(), ext_irt(self.ext)),
             flags: self.flags,
+            tlv: self.tlv.clone(),
             payload: self.payload.clone(),
         }
     }
@@ -504,6 +668,86 @@ impl Frame {
     pub fn ttl(&self) -> u8 { flags_ttl(self.flags) }
     pub fn ttl_seconds(&self) -> u32 { ttl_seconds(self.ttl()) }
 
+    // ── TLV accessors / builders ──
+
+    /// Bytes of `data` for the first matching `tag`, walking the TLV section
+    /// when `FMT_HAS_TLV` is set. `None` when the flag is unset, the tag is
+    /// absent, or the section is malformed.
+    pub fn tlv_get(&self, tag: FrameTlvTag) -> Option<&[u8]> {
+        self.tlv_get_raw(tag.as_u14())
+    }
+
+    /// Like `tlv_get`, but accepts a raw 14-bit `tag_id`. Useful for
+    /// app-defined tags whose enum lives in another crate.
+    pub fn tlv_get_raw(&self, tag_u14: u16) -> Option<&[u8]> {
+        if self.flags & FMT_HAS_TLV == 0 || self.tlv.is_empty() {
+            return None;
+        }
+        // Re-walk the section each call — the caller path is cold relative
+        // to encode/decode, and the section is at most 1020 bytes.
+        if self.tlv.len() < 4 || self.tlv.len() % 4 != 0 {
+            return None;
+        }
+        let words = self.tlv[0] as usize;
+        if words * 4 != self.tlv.len() {
+            return None;
+        }
+        let mut cursor = 4;
+        while cursor + 2 <= self.tlv.len() {
+            let hdr = u16::from_le_bytes([self.tlv[cursor], self.tlv[cursor + 1]]);
+            if hdr == 0 { return None; }
+            let tag_type = (hdr >> TLV_TAG_TYPE_SHIFT) & 0b11;
+            let tag_id = hdr & TLV_TAG_ID_MASK;
+            cursor += 2;
+            let (data_start, data_len) = match tag_type {
+                TLV_TYPE_U16 => (cursor, 2),
+                TLV_TYPE_U32 => (cursor, 4),
+                TLV_TYPE_VAR => {
+                    if cursor + 1 > self.tlv.len() { return None; }
+                    let n = self.tlv[cursor] as usize;
+                    cursor += 1;
+                    (cursor, n)
+                }
+                _ => return None,
+            };
+            if data_start + data_len > self.tlv.len() { return None; }
+            cursor = data_start + data_len;
+            if tag_id == tag_u14 {
+                return Some(&self.tlv[data_start..data_start + data_len]);
+            }
+        }
+        None
+    }
+
+    /// utf-8 wrapper around `tlv_get` (intended for VAR tags).
+    pub fn tlv_str(&self, tag: FrameTlvTag) -> Option<&str> {
+        self.tlv_get(tag).and_then(|b| std::str::from_utf8(b).ok())
+    }
+
+    /// Convenience for the most common tag.
+    pub fn source(&self) -> Option<&str> {
+        self.tlv_str(FrameTlvTag::Source)
+    }
+
+    /// Build a fresh TLV section from `tags` and set `FMT_HAS_TLV`. Replaces
+    /// any existing TLV. Each tag's value type comes from `FrameTlvValue`.
+    pub fn with_tlv(mut self, tags: &[(FrameTlvTag, FrameTlvValue<'_>)]) -> Self {
+        let mut out = Vec::new();
+        let mapped: Vec<(u16, FrameTlvValue<'_>)> = tags
+            .iter()
+            .map(|(t, v)| (t.as_u14(), v.clone()))
+            .collect();
+        encode_tlv_section(&mut out, &mapped);
+        self.tlv = out;
+        self.flags |= FMT_HAS_TLV;
+        self
+    }
+
+    /// Single-tag shortcut: stamps the Source TLV with `s.as_bytes()`.
+    pub fn with_source(self, s: &str) -> Self {
+        self.with_tlv(&[(FrameTlvTag::Source, FrameTlvValue::Bytes(s.as_bytes()))])
+    }
+
     pub fn to_debug_string(&self) -> String {
         let fmt = match self.format() { 0 => "J", 1 => "B", 2 => "R", _ => "?" };
         let mut flags_str = String::new();
@@ -517,6 +761,128 @@ impl Frame {
             fmt, flags_str,
             if self.in_reply_to() != 0 { format!(" irt={}", self.in_reply_to()) } else { String::new() },
             self.payload.len())
+    }
+}
+
+// ── SourceHandle ─────────────────────────────────────────────────────
+//
+// Bundles the requester address + the surface id + correlation context so
+// it can travel as one parameter wherever a request can produce a reply.
+// `respond_*` builders stamp the Source TLV automatically — this is the
+// guarantee that the source tag is echoed back without each call site
+// having to remember.
+
+/// Requester identity for routing replies. Built from an inbound `Frame`
+/// via `from_frame`, or constructed locally via `local`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceHandle {
+    /// Requester endpoint (mesh src of the originating frame). Used as the
+    /// reply target unless `reply_target` overrides it.
+    pub from_ep: u16,
+    /// Optional explicit reply target (e.g. SVC_DISPLAY on the requester).
+    /// Set when the caller wants replies routed to a different service
+    /// than the one they sent from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_target: Option<u16>,
+    /// Surface id (e.g. card_key on Android, pane id in TUI). Populated
+    /// from the Source TLV on inbound frames; stamped onto replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// `in_reply_to` for replies — the originating frame's `from_ep`.
+    #[serde(default)]
+    pub in_reply_to: u16,
+}
+
+impl SourceHandle {
+    /// Build from an incoming frame. Captures from_ep, in_reply_to (= the
+    /// inbound frame's from_ep, the value the existing reply helpers
+    /// already use), and the Source TLV when present.
+    pub fn from_frame(frame: &Frame) -> Self {
+        Self {
+            from_ep: frame.from_ep(),
+            reply_target: None,
+            source: frame.source().map(str::to_owned),
+            in_reply_to: frame.from_ep(),
+        }
+    }
+
+    /// Build a local-origin handle (no associated inbound frame). Used by
+    /// producers like Android / TUI / cron that originate requests rather
+    /// than reply to them.
+    pub fn local(source: Option<String>) -> Self {
+        Self {
+            from_ep: 0,
+            reply_target: None,
+            source,
+            in_reply_to: 0,
+        }
+    }
+
+    pub fn has_source(&self) -> bool { self.source.is_some() }
+
+    fn reply_to(&self) -> u16 {
+        self.reply_target.unwrap_or(self.from_ep)
+    }
+
+    fn stamp_source(&self, frame: Frame) -> Frame {
+        match &self.source {
+            Some(s) => frame.with_source(s),
+            None => frame,
+        }
+    }
+
+    /// Build a JSONL reply targeting this requester. Sets in_reply_to and
+    /// stamps the Source TLV when present.
+    pub fn respond_jsonl(&self, my_ep: u16, payload: &str) -> Frame {
+        let f = Frame {
+            mesh_key: mesh_key(my_ep, self.reply_to()),
+            ext: ext_pack(0, self.in_reply_to),
+            flags: FMT_JSONL,
+            tlv: Vec::new(),
+            payload: payload.as_bytes().to_vec(),
+        };
+        self.stamp_source(f)
+    }
+
+    /// Reply routed to a different service on the requester (e.g.
+    /// SVC_DISPLAY for status/feedback that shouldn't go back to the
+    /// dispatching service). Mirrors `Frame::reply_jsonl_svc`.
+    pub fn respond_jsonl_svc(&self, my_node: u8, from_svc: u8, to_svc: u8, payload: &str) -> Frame {
+        let to_node = ep_node(self.reply_to());
+        let f = Frame {
+            mesh_key: mesh_key(endpoint(my_node, from_svc), endpoint(to_node, to_svc)),
+            ext: ext_pack(0, self.in_reply_to),
+            flags: FMT_JSONL,
+            tlv: Vec::new(),
+            payload: payload.as_bytes().to_vec(),
+        };
+        self.stamp_source(f)
+    }
+
+    /// Raw binary reply.
+    pub fn respond_raw(&self, my_ep: u16, payload: Vec<u8>) -> Frame {
+        let f = Frame {
+            mesh_key: mesh_key(my_ep, self.reply_to()),
+            ext: ext_pack(0, self.in_reply_to),
+            flags: FMT_RAW,
+            tlv: Vec::new(),
+            payload,
+        };
+        self.stamp_source(f)
+    }
+
+    /// Originate (forward / dispatch) a JSONL frame to `to_ep` carrying this
+    /// handle's source. Used by clients dispatching to a remote service
+    /// (e.g. tablet → SVC_SKILLS on rs).
+    pub fn dispatch_jsonl(&self, my_ep: u16, to_ep: u16, payload: &str) -> Frame {
+        let f = Frame {
+            mesh_key: mesh_key(my_ep, to_ep),
+            ext: 0,
+            flags: FMT_JSONL,
+            tlv: Vec::new(),
+            payload: payload.as_bytes().to_vec(),
+        };
+        self.stamp_source(f)
     }
 }
 
@@ -545,24 +911,24 @@ impl ServiceHandle {
     /// Build a F+F JSONL frame.
     pub fn fire_json(&self, json: &str) -> Frame {
         let id = self.next_id();
-        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, id), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, id), flags: FMT_JSONL, tlv: Vec::new(), payload: json.as_bytes().to_vec() }
     }
 
     /// Build a F+F raw binary frame.
     pub fn fire_raw(&self, data: Vec<u8>) -> Frame {
-        Frame { mesh_key: self.mesh_key(), ext: 0, flags: FMT_RAW, payload: data }
+        Frame { mesh_key: self.mesh_key(), ext: 0, flags: FMT_RAW, tlv: Vec::new(), payload: data }
     }
 
     /// Build a JSONL reply to last received message.
     pub fn reply_json(&self, json: &str) -> Frame {
         let irt = self.last_recv_id.load(std::sync::atomic::Ordering::Relaxed);
-        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, irt), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(0, irt), flags: FMT_JSONL, tlv: Vec::new(), payload: json.as_bytes().to_vec() }
     }
 
     /// Build a reply with obo.
     pub fn reply_json_obo(&self, obo: u16, json: &str) -> Frame {
         let irt = self.last_recv_id.load(std::sync::atomic::Ordering::Relaxed);
-        Frame { mesh_key: self.mesh_key(), ext: ext_pack(obo, irt), flags: FMT_JSONL, payload: json.as_bytes().to_vec() }
+        Frame { mesh_key: self.mesh_key(), ext: ext_pack(obo, irt), flags: FMT_JSONL, tlv: Vec::new(), payload: json.as_bytes().to_vec() }
     }
 
     /// Record receipt of a frame from this service.
@@ -1018,6 +1384,110 @@ mod tests {
         let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "test");
         let encoded = f.encode();
         assert!(Frame::decode(&encoded[..FRAME_HEADER_SIZE]).is_none()); // header but no payload
+    }
+
+    #[test]
+    fn tlv_roundtrip_var_only() {
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), r#"{"x":1}"#)
+            .with_source("tablet-card-A");
+        assert_eq!(f.flags & FMT_HAS_TLV, FMT_HAS_TLV);
+        assert_eq!(f.source(), Some("tablet-card-A"));
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).expect("decodes");
+        assert_eq!(decoded.source(), Some("tablet-card-A"));
+        assert_eq!(decoded.payload, f.payload);
+        assert_eq!(decoded.flags & FMT_HAS_TLV, FMT_HAS_TLV);
+    }
+
+    #[test]
+    fn tlv_roundtrip_all_three_types() {
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "p")
+            .with_tlv(&[
+                (FrameTlvTag::Source, FrameTlvValue::Bytes(b"surface-1")),
+                (FrameTlvTag::ReplyTarget, FrameTlvValue::U16(0x1234)),
+                (FrameTlvTag::TaskId, FrameTlvValue::U32(0xDEADBEEF)),
+            ]);
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).expect("decodes");
+        assert_eq!(decoded.tlv_str(FrameTlvTag::Source), Some("surface-1"));
+        assert_eq!(
+            decoded.tlv_get(FrameTlvTag::ReplyTarget),
+            Some(&0x1234u16.to_le_bytes()[..])
+        );
+        assert_eq!(
+            decoded.tlv_get(FrameTlvTag::TaskId),
+            Some(&0xDEADBEEFu32.to_le_bytes()[..])
+        );
+    }
+
+    #[test]
+    fn tlv_zero_byte_var_and_max_var() {
+        // Zero-byte VAR — header(2) + len(1) + 0 bytes = 3 bytes; padded.
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "p")
+            .with_tlv(&[(FrameTlvTag::Source, FrameTlvValue::Bytes(&[]))]);
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.tlv_get(FrameTlvTag::Source), Some(&[][..]));
+
+        // Max VAR — 255-byte payload.
+        let big = vec![0x42u8; 255];
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "p")
+            .with_tlv(&[(FrameTlvTag::Source, FrameTlvValue::Bytes(&big))]);
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.tlv_get(FrameTlvTag::Source), Some(&big[..]));
+    }
+
+    #[test]
+    fn tlv_unknown_tag_id_walked_past() {
+        // Place an unknown id (0x00FF, reserved-routing range, no enum
+        // variant) before a known one. Walker should skip cleanly to
+        // the known one.
+        let f = Frame::jsonl(endpoint(1, 0), endpoint(2, 0), "p")
+            .with_tlv(&[
+                (FrameTlvTag::TaskId, FrameTlvValue::U32(0xCAFEBABE)),
+                (FrameTlvTag::Source, FrameTlvValue::Bytes(b"hello")),
+            ]);
+        let encoded = f.encode();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.source(), Some("hello"));
+        assert!(FrameTlvTag::try_from_u14(0x00FF).is_none());
+    }
+
+    #[test]
+    fn tlv_relay_copy_via_forward() {
+        // forward() must preserve TLV bytes verbatim — that's the
+        // routing-critical invariant.
+        let original = Frame::jsonl(endpoint(1, 0), endpoint(2, SVC_SKILLS), "{}")
+            .with_source("origin-card");
+        let forwarded = original.forward(endpoint(3, 0), endpoint(4, SVC_SKILLS));
+        assert_eq!(forwarded.tlv, original.tlv);
+        assert_eq!(forwarded.source(), Some("origin-card"));
+    }
+
+    #[test]
+    fn source_handle_roundtrip_via_respond_jsonl() {
+        // Inbound: a tablet sends a Dispatch with source=tablet-card-A.
+        let inbound = Frame::jsonl(endpoint(7, 0), endpoint(2, SVC_SKILLS), "{}")
+            .with_source("tablet-card-A");
+        let handle = SourceHandle::from_frame(&inbound);
+        assert_eq!(handle.source.as_deref(), Some("tablet-card-A"));
+        assert_eq!(handle.from_ep, endpoint(7, 0));
+
+        // The host replies via the handle — source MUST round-trip.
+        let reply = handle.respond_jsonl(endpoint(2, SVC_SKILLS), r#"{"status":"running"}"#);
+        assert_eq!(reply.source(), Some("tablet-card-A"));
+        assert_eq!(reply.in_reply_to(), endpoint(7, 0));
+        assert_eq!(reply.to_ep(), endpoint(7, 0));
+    }
+
+    #[test]
+    fn source_handle_no_source_emits_no_tlv() {
+        let h = SourceHandle::local(None);
+        let f = h.dispatch_jsonl(endpoint(1, 0), endpoint(2, SVC_SKILLS), "{}");
+        assert_eq!(f.flags & FMT_HAS_TLV, 0);
+        assert!(f.tlv.is_empty());
+        assert_eq!(f.source(), None);
     }
 
     #[test]
