@@ -791,6 +791,35 @@ pub struct SourceHandle {
     /// `in_reply_to` for replies — the originating frame's `from_ep`.
     #[serde(default)]
     pub in_reply_to: u16,
+    /// Task this handle refers to (set after task creation by the
+    /// owning service — e.g. SkillsHost stamps it onto the inbound
+    /// handle when it mints a TaskEntry). When set, `write_text` /
+    /// `write_lines` / `close_task` route through the installed
+    /// `TaskOutputSink` to stream output back to the originating
+    /// surface. Old serialized handles still decode (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// Sink for streaming task output. Implemented by the `task_client`
+/// crate and installed once at startup via
+/// [`install_task_output_sink`]. `SourceHandle::write_text` and
+/// friends route through whichever sink is installed; if none is set
+/// (cron / standalone tests / pre-startup) the calls no-op.
+pub trait TaskOutputSink: Send + Sync {
+    fn write_text(&self, task_id: &str, line: &str);
+    fn write_lines(&self, task_id: &str, lines: &[&str]);
+    fn close(&self, task_id: &str);
+}
+
+static TASK_OUTPUT_SINK: std::sync::OnceLock<std::sync::Arc<dyn TaskOutputSink>> =
+    std::sync::OnceLock::new();
+
+/// Install the global task-output sink. Idempotent — first installer
+/// wins. Subsequent calls are silently ignored, so a single rs-side
+/// `task_client::output::install()` is the canonical setup site.
+pub fn install_task_output_sink(sink: std::sync::Arc<dyn TaskOutputSink>) {
+    let _ = TASK_OUTPUT_SINK.set(sink);
 }
 
 impl SourceHandle {
@@ -803,6 +832,7 @@ impl SourceHandle {
             reply_target: None,
             source: frame.source().map(str::to_owned),
             in_reply_to: frame.from_ep(),
+            task_id: None,
         }
     }
 
@@ -815,10 +845,51 @@ impl SourceHandle {
             reply_target: None,
             source,
             in_reply_to: 0,
+            task_id: None,
         }
     }
 
     pub fn has_source(&self) -> bool { self.source.is_some() }
+
+    /// Tag this handle with the task it refers to. Owning services
+    /// call this once they've minted a TaskEntry — subsequent
+    /// `write_text` / `write_lines` calls then route through the
+    /// installed `TaskOutputSink` keyed by this id.
+    pub fn with_task_id(mut self, task_id: String) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    /// Append a single line to the originating task's output stream.
+    /// No-op if `task_id` isn't set or no `TaskOutputSink` has been
+    /// installed (cron / standalone tests / pre-startup window).
+    pub fn write_text(&self, line: &str) {
+        if let (Some(tid), Some(sink)) =
+            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
+        {
+            sink.write_text(tid, line);
+        }
+    }
+
+    /// Append a batch of lines to the originating task's output stream.
+    pub fn write_lines(&self, lines: &[&str]) {
+        if let (Some(tid), Some(sink)) =
+            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
+        {
+            sink.write_lines(tid, lines);
+        }
+    }
+
+    /// Close the originating task's output stream — sent on terminal
+    /// (Final) state. Subscribers receive a `Close` frame and the
+    /// registry drops the buffer.
+    pub fn close_task(&self) {
+        if let (Some(tid), Some(sink)) =
+            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
+        {
+            sink.close(tid);
+        }
+    }
 
     fn reply_to(&self) -> u16 {
         self.reply_target.unwrap_or(self.from_ep)
@@ -1488,6 +1559,34 @@ mod tests {
         assert_eq!(f.flags & FMT_HAS_TLV, 0);
         assert!(f.tlv.is_empty());
         assert_eq!(f.source(), None);
+    }
+
+    #[test]
+    fn source_handle_with_task_id_round_trips_serde() {
+        // Old serialized handles (without task_id) must still decode,
+        // and new handles must serialize task_id when present.
+        let h = SourceHandle::local(Some("card-A".into())).with_task_id("t-42".into());
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("\"task_id\":\"t-42\""));
+        let back: SourceHandle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id.as_deref(), Some("t-42"));
+
+        // Old shape without task_id still decodes (field has serde
+        // default).
+        let old = r#"{"from_ep":0,"source":"x","in_reply_to":0}"#;
+        let h: SourceHandle = serde_json::from_str(old).unwrap();
+        assert_eq!(h.task_id, None);
+    }
+
+    #[test]
+    fn source_handle_write_text_no_op_without_sink() {
+        // Without an installed sink, write_text / write_lines /
+        // close_task must silently no-op — used by tests, cron, and
+        // any code path that runs before install_task_output_sink.
+        let h = SourceHandle::local(Some("s".into())).with_task_id("t-1".into());
+        h.write_text("hi");        // must not panic
+        h.write_lines(&["a", "b"]); // must not panic
+        h.close_task();            // must not panic
     }
 
     #[test]
