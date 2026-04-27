@@ -204,6 +204,35 @@ impl<T: MuxTransport> MuxSession<T> {
         Self::from_parts(conn, stream0, on_frame, on_stream)
     }
 
+    /// Connect over an arbitrary already-open transport as the
+    /// yamux client. Mirrors `accept` for callers that don't want
+    /// the TCP-specific `connect(addr)` — e.g. UDS yamux sessions
+    /// where the caller has the `UnixStream` in hand.
+    ///
+    /// Opens stream 0 outbound and starts background tasks.
+    ///
+    /// **Note**: yamux opens stream 0 optimistically — the SYN bytes
+    /// are queued but won't reach the server until the connection's
+    /// poller flushes them. In practice this happens as soon as the
+    /// client pushes its first application frame (e.g. Register /
+    /// Ident); a connect followed by a long idle period may leave
+    /// the server's `accept` blocked. Production callers always send
+    /// something right after connect; tests should do the same.
+    pub async fn connect_with_transport(
+        transport: T,
+        on_frame: FrameHandler,
+        on_stream: Option<StreamHandler>,
+    ) -> Result<Self, String> {
+        let cfg = yamux::Config::default();
+        let mut conn = yamux::Connection::new(transport, cfg, yamux::Mode::Client);
+
+        let stream0 = futures_lite::future::poll_fn(|cx| conn.poll_new_outbound(cx))
+            .await
+            .map_err(|e| format!("yamux stream 0: {e}"))?;
+
+        Self::from_parts(conn, stream0, on_frame, on_stream)
+    }
+
     /// Build from existing connection + stream 0.
     fn from_parts(
         conn: yamux::Connection<T>,
