@@ -1168,6 +1168,15 @@ pub enum ProcessMsg {
         /// row (/code, /plan, /refine, /execute).
         #[serde(default)]
         interactive: bool,
+        /// Caller-minted task identity. When non-empty, the host
+        /// (process_engine, etc.) adopts this id verbatim instead of
+        /// minting one — the same id then identifies the task at
+        /// every layer (tasks_engine entry, ProcessRecord,
+        /// `<task_id>-console` StreamRegistry key, substream Connect
+        /// target, viewer pane). Empty string keeps the legacy
+        /// "host mints its own" behavior for older callers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        task_id: String,
     },
     SubmitTicket {
         project_id: String, prompt: String,
