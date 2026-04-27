@@ -38,7 +38,8 @@ pub const SVC_SERIAL:            u8 = 13;
 pub const SVC_DATA:              u8 = 14;
 pub const SVC_ANDROID:           u8 = 15;
 pub const SVC_SKILLS:            u8 = 16;
-// 17-63: dynamic services
+pub const SVC_CONSOLE:           u8 = 17;
+// 18-63: dynamic services
 
 // ── Role bits (u64 bitmap, Ident `roles` field) ──────────────────────
 
@@ -58,6 +59,7 @@ pub const ROLE_SERIAL:            u64 = 1 << SVC_SERIAL;
 pub const ROLE_DATA:              u64 = 1 << SVC_DATA;
 pub const ROLE_ANDROID:          u64 = 1 << SVC_ANDROID;
 pub const ROLE_SKILLS:            u64 = 1 << SVC_SKILLS;
+pub const ROLE_CONSOLE:           u64 = 1 << SVC_CONSOLE;
 
 pub const fn svc_to_role(svc: u8) -> u64 { 1u64 << svc }
 pub const fn role_to_svc(role: u64) -> u8 { role.trailing_zeros() as u8 }
@@ -72,7 +74,7 @@ pub fn services_to_str(services: u64) -> String {
         (SVC_HEURISTIC_ROUTER, "heuristic_router"), (SVC_TERMINAL, "terminal"),
         (SVC_ASR, "asr"), (SVC_DISPLAY, "display"), (SVC_SERIAL, "serial"),
         (SVC_DATA, "data"), (SVC_ANDROID, "android"),
-        (SVC_SKILLS, "skills"),
+        (SVC_SKILLS, "skills"), (SVC_CONSOLE, "console"),
     ];
     let mut parts = Vec::new();
     for &(svc, name) in NAMES {
@@ -104,6 +106,7 @@ pub fn services_from_strs(names: &[String]) -> u64 {
             "data" => services |= ROLE_DATA,
             "android" => services |= ROLE_ANDROID,
             "skills" => services |= ROLE_SKILLS,
+            "console" => services |= ROLE_CONSOLE,
             _ => {}
         }
     }
@@ -270,6 +273,8 @@ pub fn addr_label(a: u16) -> String {
                 SVC_SERIAL => "serial",
                 SVC_DATA => "data",
                 SVC_ANDROID => "android",
+                SVC_SKILLS => "skills",
+                SVC_CONSOLE => "console",
                 _ => return format!("{}/svc:{}", node_str, id),
             };
             return format!("{}/{}", node_str, svc_name);
