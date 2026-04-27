@@ -325,10 +325,21 @@ impl<T: MuxTransport> MuxSession<T> {
                     Ok(n) => {
                         log::info!("[mux] reader: {} bytes (pending {})", n, pending.len() + n);
                         pending.extend_from_slice(&buf[..n]);
+                        let hex_sample: String = pending.iter().take(48)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        log::info!("[mux] pending hex: {hex_sample} (total {} bytes)", pending.len());
+                        let mut decoded = 0usize;
                         while let Some((frame, consumed)) = Frame::decode(&pending) {
-                            log::debug!("[mux] decoded frame: {}B fmt={}", frame.payload.len(), frame.format());
+                            decoded += 1;
+                            log::info!("[mux] decoded frame {decoded}: {}B fmt={} from=0x{:04x} to=0x{:04x}",
+                                frame.payload.len(), frame.format(), frame.from_ep(), frame.to_ep());
                             on_frame(&frame);
                             pending = pending[consumed..].to_vec();
+                        }
+                        if decoded == 0 {
+                            log::warn!("[mux] no frame decoded from {} pending bytes", pending.len());
                         }
                     }
                     Err(e) => {
