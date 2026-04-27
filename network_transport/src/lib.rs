@@ -806,10 +806,17 @@ pub struct SourceHandle {
 /// [`install_task_output_sink`]. `SourceHandle::write_text` and
 /// friends route through whichever sink is installed; if none is set
 /// (cron / standalone tests / pre-startup) the calls no-op.
+///
+/// The `stream_id` namespace is intentionally generic — it's whatever
+/// string both producer and consumer agree on. For skill invocations
+/// driven from a UI surface, it's the Source TLV value (the client's
+/// card_key), so half-connected viewers can pre-subscribe before the
+/// server mints a task. For producer-led tasks with no originating
+/// surface (third-party tap-to-view), it's the task_id.
 pub trait TaskOutputSink: Send + Sync {
-    fn write_text(&self, task_id: &str, line: &str);
-    fn write_lines(&self, task_id: &str, lines: &[&str]);
-    fn close(&self, task_id: &str);
+    fn write_text(&self, stream_id: &str, line: &str);
+    fn write_lines(&self, stream_id: &str, lines: &[&str]);
+    fn close(&self, stream_id: &str);
 }
 
 static TASK_OUTPUT_SINK: std::sync::OnceLock<std::sync::Arc<dyn TaskOutputSink>> =
@@ -852,31 +859,41 @@ impl SourceHandle {
     pub fn has_source(&self) -> bool { self.source.is_some() }
 
     /// Tag this handle with the task it refers to. Owning services
-    /// call this once they've minted a TaskEntry — subsequent
-    /// `write_text` / `write_lines` calls then route through the
-    /// installed `TaskOutputSink` keyed by this id.
+    /// call this once they've minted a TaskEntry. `task_id` is used
+    /// as the stream key only when there's no `source` set —
+    /// `stream_id()` prefers `source` so half-connected viewers
+    /// (which only know their own surface key, not the server-minted
+    /// task_id) can pre-subscribe.
     pub fn with_task_id(mut self, task_id: String) -> Self {
         self.task_id = Some(task_id);
         self
     }
 
+    /// Stream identity for output routing. Prefers `source` (the
+    /// originating surface, known to the client from the moment of
+    /// invocation) over `task_id` (server-minted, known only after
+    /// the task lands). Both producer and viewer must agree on this
+    /// string for streams to connect — when the viewer pre-subscribes
+    /// before a task exists, they register under the same `source`
+    /// they stamped into the inbound Source TLV.
+    pub fn stream_id(&self) -> Option<&str> {
+        self.source.as_deref().or(self.task_id.as_deref())
+    }
+
     /// Append a single line to the originating task's output stream.
-    /// No-op if `task_id` isn't set or no `TaskOutputSink` has been
-    /// installed (cron / standalone tests / pre-startup window).
+    /// No-op if no `stream_id` is resolvable (handle has neither
+    /// source nor task_id) or no `TaskOutputSink` has been installed
+    /// (cron / standalone tests / pre-startup window).
     pub fn write_text(&self, line: &str) {
-        if let (Some(tid), Some(sink)) =
-            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
-        {
-            sink.write_text(tid, line);
+        if let (Some(sid), Some(sink)) = (self.stream_id(), TASK_OUTPUT_SINK.get()) {
+            sink.write_text(sid, line);
         }
     }
 
     /// Append a batch of lines to the originating task's output stream.
     pub fn write_lines(&self, lines: &[&str]) {
-        if let (Some(tid), Some(sink)) =
-            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
-        {
-            sink.write_lines(tid, lines);
+        if let (Some(sid), Some(sink)) = (self.stream_id(), TASK_OUTPUT_SINK.get()) {
+            sink.write_lines(sid, lines);
         }
     }
 
@@ -884,10 +901,8 @@ impl SourceHandle {
     /// (Final) state. Subscribers receive a `Close` frame and the
     /// registry drops the buffer.
     pub fn close_task(&self) {
-        if let (Some(tid), Some(sink)) =
-            (self.task_id.as_deref(), TASK_OUTPUT_SINK.get())
-        {
-            sink.close(tid);
+        if let (Some(sid), Some(sink)) = (self.stream_id(), TASK_OUTPUT_SINK.get()) {
+            sink.close(sid);
         }
     }
 
@@ -1576,6 +1591,25 @@ mod tests {
         let old = r#"{"from_ep":0,"source":"x","in_reply_to":0}"#;
         let h: SourceHandle = serde_json::from_str(old).unwrap();
         assert_eq!(h.task_id, None);
+    }
+
+    #[test]
+    fn source_handle_stream_id_prefers_source_over_task_id() {
+        // Surface key (source TLV) wins — that's the id the
+        // half-connected viewer knows from the moment of click,
+        // before the server mints task_id.
+        let h = SourceHandle::local(Some("card-A".into()))
+            .with_task_id("task-42".into());
+        assert_eq!(h.stream_id(), Some("card-A"));
+
+        // No source: fall back to task_id — third-party tap-to-view
+        // path where the viewer knows task_id but no surface.
+        let h = SourceHandle::local(None).with_task_id("task-42".into());
+        assert_eq!(h.stream_id(), Some("task-42"));
+
+        // Neither: cron / daemon — no stream.
+        let h = SourceHandle::local(None);
+        assert_eq!(h.stream_id(), None);
     }
 
     #[test]
